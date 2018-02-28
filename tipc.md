@@ -350,6 +350,6 @@ Q:
 2. Why need to create a socket?
 3. What's the meaning?
 4. Why need to bind a socket with a port or port name(TIPC)?
-5. TIPC 不存在socket 的未决链接？ Why?
+5. TIPC 不存在socket 的未决链接？ Why? 存在，当使用流socket时 是存在的
 ![Alt text](/pic/socket_no_define.png)
 6. 
