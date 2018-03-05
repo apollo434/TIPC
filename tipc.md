@@ -350,10 +350,384 @@ Q:
 2. Why need to create a socket?
 3. What's the meaning?
 4. Why need to bind a socket with a port or port name(TIPC)?
-5. TIPC 不存在socket 的未决链接？ Why? 存在，当使用流socket时 是存在的
+A: For matching receiving packets.
+5. TIPC 不存在socket 的未决链接？ Why?
+A: 存在，当使用流socket时 是存在的
 ![Alt text](/pic/socket_no_define.png)
 6. 数据报socket上使用connect()的作用？
 7. socket套接字描述符和文件描述符是否一致？
-套接字描述和文件描述符在linux下是一样的，其实我就是想问当进程有套接字描述符和打开的文件描述符是否都是在那个集里面。当然测试后，其实都在同一个集合里面。 
+A: 套接字描述和文件描述符在linux下是一样的，其实我就是想问当进程有套接字描述符和打开的文件描述符是否都是在那个集里面。当然测试后，其实都在同一个集合里面。
 8. socket的fd也是在每进程中存在吗？即fd依附于进程控制块？
-9. 
+A: Yes
+9. How to complete "syscall"?
+10. What's the call chain of socket?
+A:
+
+```
+(net/socket.c)
+SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
+	sys_socket
+	  |
+		|---> SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
+						sock_create
+							__sock_create
+								sock_alloc /*create inode in vfs*/
+								pf = rcu_dereference(net_families[family]) /* find the net_families based on family type*/
+								err = pf->create(net, sock, protocol, kern); /* create the socket based on net_families[family] */								
+						sock_map_fd
+							sock_alloc_file /* allocate file and fd */
+							fd_install /* Let fd point to file */
+```
+![Alt text](/pic/socket_chain.png)
+11. Does TIPC has MAC address concept?
+12. What's the relationship between process and socket?
+A:
+![Alt text](/pic/pft_socket.png)
+13. How to init protocol family?
+A:
+
+1) Create the socket in VFS
+```
+(net/socket.c)
+static struct file_system_type sock_fs_type = {
+        .name =         "sockfs",
+        .mount =        sockfs_mount,
+        .kill_sb =      kill_anon_super,
+};
+
+
+static int __init sock_init(void)
+{
+        int err;
+        /*
+         *      Initialize the network sysctl infrastructure.
+         */
+        err = net_sysctl_init();
+        if (err)
+                goto out;
+
+        /*
+         *      Initialize skbuff SLAB cache
+         */
+        skb_init();
+
+        /*
+         *      Initialize the protocols module.
+         */
+
+        init_inodecache();
+
+        err = register_filesystem(&sock_fs_type);
+        if (err)
+                goto out_fs;
+        sock_mnt = kern_mount(&sock_fs_type);
+        if (IS_ERR(sock_mnt)) {
+                err = PTR_ERR(sock_mnt);
+                goto out_mount;
+        }
+
+        /* The real protocol initialization is performed in later initcalls.
+         */
+
+#ifdef CONFIG_NETFILTER
+        err = netfilter_init();
+        if (err)
+                goto out;
+#endif
+
+        ptp_classifier_init();
+
+out:
+        return err;
+
+out_mount:
+        unregister_filesystem(&sock_fs_type);
+out_fs:
+        goto out;
+}
+```
+2) How to register the net families
+
+```
+/*
+ * Define the net families
+ *
+ */
+
+static const struct net_proto_family __rcu *net_families[NPROTO] __read_mostly;
+
+/**
+ *      sock_register - add a socket protocol handler
+ *      @ops: description of protocol
+ *              
+ *      This function is called by a protocol handler that wants to
+ *      advertise its address family, and have it linked into the
+ *      socket interface. The value ops->family corresponds to the
+ *      socket system call protocol family.
+ */     
+int sock_register(const struct net_proto_family *ops)
+{
+        int err;
+
+        if (ops->family >= NPROTO) {
+                pr_crit("protocol %d >= NPROTO(%d)\n", ops->family, NPROTO);
+                return -ENOBUFS;
+        }
+
+        spin_lock(&net_family_lock);
+        if (rcu_dereference_protected(net_families[ops->family],
+                                      lockdep_is_held(&net_family_lock)))
+                err = -EEXIST;
+        else {
+                rcu_assign_pointer(net_families[ops->family], ops);
+                err = 0;
+        }
+        spin_unlock(&net_family_lock);
+
+        pr_info("NET: Registered protocol family %d\n", ops->family);
+        return err;
+}
+EXPORT_SYMBOL(sock_register);
+
+```
+3) Take TIPC as an example, TIPC Init
+```
+(net/tipc/socket.c)
+
+static const struct net_proto_family tipc_family_ops = {
+        .owner          = THIS_MODULE,
+        .family         = AF_TIPC,
+        .create         = tipc_sk_create
+};
+
+
+/**
+ * tipc_socket_init - initialize TIPC socket interface
+ *
+ * Returns 0 on success, errno otherwise
+ */
+int tipc_socket_init(void)
+{
+        int res;
+
+        res = proto_register(&tipc_proto, 1);
+        if (res) {
+                pr_err("Failed to register TIPC protocol type\n");
+                goto out;
+        }
+
+        res = sock_register(&tipc_family_ops);
+        if (res) {
+                pr_err("Failed to register TIPC socket type\n");
+                proto_unregister(&tipc_proto);
+                goto out;
+        }
+ out:
+        return res;
+}
+
+
+
+
+(net/tipc/core.c)
+static int __init tipc_init(void)
+{
+        int err;
+
+        pr_info("Activated (version " TIPC_MOD_VER ")\n");
+
+        sysctl_tipc_rmem[0] = TIPC_CONN_OVERLOAD_LIMIT >> 4 <<
+                              TIPC_LOW_IMPORTANCE;
+        sysctl_tipc_rmem[1] = TIPC_CONN_OVERLOAD_LIMIT >> 4 <<
+                              TIPC_CRITICAL_IMPORTANCE;
+        sysctl_tipc_rmem[2] = TIPC_CONN_OVERLOAD_LIMIT;
+
+        err = tipc_netlink_start();
+        if (err)
+                goto out_netlink;
+
+        err = tipc_netlink_compat_start();
+        if (err)
+                goto out_netlink_compat;
+
+        err = tipc_socket_init();
+        if (err)
+                goto out_socket;
+
+        err = tipc_register_sysctl();
+        if (err)
+                goto out_sysctl;
+
+        err = register_pernet_subsys(&tipc_net_ops);
+        if (err)
+                goto out_pernet;
+
+        err = tipc_bearer_setup();
+        if (err)
+                goto out_bearer;
+
+        pr_info("Started in single node mode\n");
+        return 0;
+out_bearer:
+        unregister_pernet_subsys(&tipc_net_ops);
+out_pernet:
+        tipc_unregister_sysctl();
+out_sysctl:
+        tipc_socket_stop();
+out_socket:
+        tipc_netlink_compat_stop();
+out_netlink_compat:
+        tipc_netlink_stop();
+out_netlink:
+        pr_err("Unable to start in single node mode\n");
+        return err;
+}
+
+
+```
+4) Take ipv4 as an example, ipv4 Init
+```
+(net/ipv4/af_inet.c)
+static const struct net_proto_family inet_family_ops = {
+        .family = PF_INET,
+        .create = inet_create,
+        .owner  = THIS_MODULE,
+};
+
+static int __init inet_init(void)
+{
+        struct inet_protosw *q;
+        struct list_head *r;
+        int rc = -EINVAL;
+
+        sock_skb_cb_check_size(sizeof(struct inet_skb_parm));
+
+        rc = proto_register(&tcp_prot, 1);
+        if (rc)
+                goto out;
+
+        rc = proto_register(&udp_prot, 1);
+        if (rc)
+                goto out_unregister_tcp_proto;
+
+        rc = proto_register(&raw_prot, 1);
+        if (rc)
+                goto out_unregister_udp_proto;
+
+        rc = proto_register(&ping_prot, 1);
+        if (rc)
+                goto out_unregister_raw_proto;
+
+        /*      
+         *      Tell SOCKET that we are alive...
+         */
+
+        (void)sock_register(&inet_family_ops);
+
+#ifdef CONFIG_SYSCTL
+        ip_static_sysctl_init();
+#endif
+
+        /*
+         *      Add all the base protocols.
+         */
+
+        if (inet_add_protocol(&icmp_protocol, IPPROTO_ICMP) < 0)
+                pr_crit("%s: Cannot add ICMP protocol\n", __func__);
+        if (inet_add_protocol(&udp_protocol, IPPROTO_UDP) < 0)
+                pr_crit("%s: Cannot add UDP protocol\n", __func__);
+        if (inet_add_protocol(&tcp_protocol, IPPROTO_TCP) < 0)
+                pr_crit("%s: Cannot add TCP protocol\n", __func__);
+#ifdef CONFIG_IP_MULTICAST
+        if (inet_add_protocol(&igmp_protocol, IPPROTO_IGMP) < 0)
+                pr_crit("%s: Cannot add IGMP protocol\n", __func__);
+        if (inet_add_protocol(&igmp_protocol, IPPROTO_IGMP) < 0)
+                pr_crit("%s: Cannot add IGMP protocol\n", __func__);
+#endif
+
+        /* Register the socket-side information for inet_create. */
+        for (r = &inetsw[0]; r < &inetsw[SOCK_MAX]; ++r)
+                INIT_LIST_HEAD(r);
+
+        for (q = inetsw_array; q < &inetsw_array[INETSW_ARRAY_LEN]; ++q)
+                inet_register_protosw(q);
+
+        /*
+         *      Set the ARP module up
+         */
+
+        arp_init();
+
+        /*
+         *      Set the IP module up
+         */
+
+        ip_init();
+
+        tcp_v4_init();
+
+        /* Setup TCP slab cache for open requests. */
+        tcp_init();
+
+        /* Setup UDP memory threshold */
+        udp_init();
+
+        /* Add UDP-Lite (RFC 3828) */
+        udplite4_register();
+
+        ping_init();
+
+        /*
+         *      Set the ICMP layer up
+         */
+
+        if (icmp_init() < 0)
+                panic("Failed to create the ICMP control socket.\n");
+
+        /*
+         *      Initialise the multicast router
+         */
+#if defined(CONFIG_IP_MROUTE)
+        if (ip_mr_init())
+                pr_crit("%s: Cannot init ipv4 mroute\n", __func__);
+#endif
+        if (init_inet_pernet_ops())
+                pr_crit("%s: Cannot init ipv4 inet pernet ops\n", __func__);
+        /*
+         *      Initialise per-cpu ipv4 mibs
+         */
+
+        if (init_ipv4_mibs())
+                pr_crit("%s: Cannot init ipv4 mibs\n", __func__);
+
+        ipv4_proc_init();
+
+        ipfrag_init();
+
+        dev_add_pack(&ip_packet_type);
+
+        rc = 0;
+out:
+        return rc;
+out_unregister_raw_proto:
+        proto_unregister(&raw_prot);
+out_unregister_udp_proto:
+        proto_unregister(&udp_prot);
+out_unregister_tcp_proto:
+        proto_unregister(&tcp_prot);
+        goto out;
+}
+
+fs_initcall(inet_init);
+
+
+```
+14. Regarding bear in TIPC
+
+```
+(net/tipc/core.c)
+tipc_init
+	tipc_bearer_setup
+		
+
+```
