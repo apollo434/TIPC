@@ -728,6 +728,124 @@ fs_initcall(inet_init);
 (net/tipc/core.c)
 tipc_init
 	tipc_bearer_setup
-		
+		dev_add_pack(&tipc_packet_type)
+
+static struct packet_type tipc_packet_type __read_mostly = {
+        .type = htons(ETH_P_TIPC),
+        .func = tipc_l2_rcv_msg,
+};
+
+/**
+ * tipc_l2_rcv_msg - handle incoming TIPC message from an interface
+ * @buf: the received packet
+ * @dev: the net device that the packet was received on
+ * @pt: the packet_type structure which was used to register this handler
+ * @orig_dev: the original receive net device in case the device is a bond
+ *
+ * Accept only packets explicitly sent to this node, or broadcast packets;
+ * ignores packets sent using interface multicast, and traffic sent to other
+ * nodes (which can happen if interface is running in promiscuous mode).
+ */
+static int tipc_l2_rcv_msg(struct sk_buff *buf, struct net_device *dev,
+                           struct packet_type *pt, struct net_device *orig_dev)
+{
+        struct tipc_bearer *b_ptr;
+
+        rcu_read_lock();
+        b_ptr = rcu_dereference_rtnl(dev->tipc_ptr);
+        if (likely(b_ptr)) {
+                if (likely(buf->pkt_type <= PACKET_BROADCAST)) {
+                        buf->next = NULL;
+                        tipc_rcv(dev_net(dev), buf, b_ptr);
+                        rcu_read_unlock();
+                        return NET_RX_SUCCESS;
+                }
+        }
+        rcu_read_unlock();
+
+        kfree_skb(buf);
+        return NET_RX_DROP;
+}
+
+The tipc_rcv() is the entry into tipc protocol stack from l2.
+
+```
+
+15. Regarding neighbor discovery, how and what to do about it?
+
+A:
+
+In tipc protocol:
+When a node is started it must make the rest of the cluster aware of its existence,
+and itself learn the topology of the cluster. Once a neighbouring node has been
+detected on a bearer, a signalling link is established towards it.
+
+Thus, when and how does one node let other ones to know itself.
+
+tipc_enable_bearer() will create a tipc_bearer and broadcast its existence.
+
+```
+(net/tipc/bearer.c)
+
+static int tipc_enable_bearer(struct net *net, const char *name,
+			      u32 disc_domain, u32 priority,
+			      struct nlattr *attr[])
+{
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+	struct tipc_bearer *b_ptr;
+	struct tipc_media *m_ptr;
+	>>>>>
+	m_ptr = tipc_media_find(b_names.media_name);
+>>>>>>>>>>>>>
+The possible medias.
+
+static struct tipc_media * const media_info_array[] = {
+	&eth_media_info,
+#ifdef CONFIG_TIPC_MEDIA_IB
+	&ib_media_info,
+#endif
+#ifdef CONFIG_TIPC_MEDIA_UDP
+	&udp_media_info,
+#endif
+	NULL
+};
+>>>>>>>>>>>>>>
+	>>>>>//create a tipc_bear
+	b_ptr = kzalloc(sizeof(*b_ptr), GFP_ATOMIC);
+	if (!b_ptr)
+		return -ENOMEM;
+
+	strcpy(b_ptr->name, name);
+	b_ptr->media = m_ptr;
+	res = m_ptr->enable_media(net, b_ptr, attr);
+	if (res) {
+		pr_warn("Bearer <%s> rejected, enable failure (%d)\n",
+			name, -res);
+		return -EINVAL;
+	}
+
+	b_ptr->identity = bearer_id;
+	b_ptr->tolerance = m_ptr->tolerance;
+	b_ptr->window = m_ptr->window;
+	b_ptr->domain = disc_domain;
+	b_ptr->net_plane = bearer_id + 'A';
+	b_ptr->priority = priority;
+
+	//broadcast its existence
+	res = tipc_disc_create(net, b_ptr, &b_ptr->bcast_addr);
+	if (res) {
+		bearer_disable(net, b_ptr, false);
+		pr_warn("Bearer <%s> rejected, discovery object creation failed\n",
+			name);
+		return -EINVAL;
+	}
+
+	rcu_assign_pointer(tn->bearer_list[bearer_id], b_ptr);
+
+	pr_info("Enabled bearer <%s>, discovery domain %s, priority %u\n",
+		name,
+		tipc_addr_string_fill(addr_string, disc_domain), priority);
+	return res;
+}
 
 ```
