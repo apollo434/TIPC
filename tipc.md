@@ -367,12 +367,15 @@ A:
 (net/socket.c)
 SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
 	sys_socket
-	  |
-  	|---> SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
+		|
+			|---> SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
 						sock_create
 							__sock_create
 								sock_alloc /*create inode in vfs*/
 								pf = rcu_dereference(net_families[family]) /* find the net_families based on family type*/
+>>>>
+static const struct net_proto_family __rcu *net_families[NPROTO] __read_mostly;
+>>>>								
 								err = pf->create(net, sock, protocol, kern); /* create the socket based on net_families[family] */								
 						sock_map_fd
 							sock_alloc_file /* allocate file and fd */
