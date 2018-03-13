@@ -379,10 +379,14 @@ SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
 							fd_install /* Let fd point to file */
 ```
 ![Alt text](/pic/socket_chain.png)
+
 11. Does TIPC has MAC address concept?
+
 12. What's the relationship between process and socket?
 A:
+
 ![Alt text](/pic/pft_socket.png)
+
 13. How to init protocol family?
 A:
 
