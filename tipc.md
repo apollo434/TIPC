@@ -376,6 +376,301 @@ struct socket {
         const struct proto_ops  *ops;
 };
 
+(include/net/sock.h)
+/**
+  *     struct sock - network layer representation of sockets
+  *     @__sk_common: shared layout with inet_timewait_sock
+  *     @sk_shutdown: mask of %SEND_SHUTDOWN and/or %RCV_SHUTDOWN
+  *     @sk_userlocks: %SO_SNDBUF and %SO_RCVBUF settings
+  *     @sk_lock:       synchronizer
+  *     @sk_rcvbuf: size of receive buffer in bytes
+  *     @sk_wq: sock wait queue and async head
+  *     @sk_rx_dst: receive input route used by early demux
+  *     @sk_dst_cache: destination cache
+  *     @sk_dst_lock: destination cache lock
+  *     @sk_policy: flow policy
+  *     @sk_receive_queue: incoming packets
+  *     @sk_wmem_alloc: transmit queue bytes committed
+  *     @sk_write_queue: Packet sending queue
+  *     @sk_omem_alloc: "o" is "option" or "other"
+  *     @sk_wmem_queued: persistent queue size
+  *     @sk_forward_alloc: space allocated forward
+  *     @sk_napi_id: id of the last napi context to receive data for sk
+  *     @sk_ll_usec: usecs to busypoll when there is no data
+  *     @sk_allocation: allocation mode
+  *     @sk_pacing_rate: Pacing rate (if supported by transport/packet scheduler)
+  *     @sk_max_pacing_rate: Maximum pacing rate (%SO_MAX_PACING_RATE)
+  *     @sk_sndbuf: size of send buffer in bytes
+  *     @sk_flags: %SO_LINGER (l_onoff), %SO_BROADCAST, %SO_KEEPALIVE,
+  *                %SO_OOBINLINE settings, %SO_TIMESTAMPING settings
+  *     @sk_no_check_tx: %SO_NO_CHECK setting, set checksum in TX packets
+  *     @sk_no_check_rx: allow zero checksum in RX packets
+  *     @sk_route_caps: route capabilities (e.g. %NETIF_F_TSO)
+  *     @sk_route_nocaps: forbidden route capabilities (e.g NETIF_F_GSO_MASK)
+  *     @sk_gso_type: GSO type (e.g. %SKB_GSO_TCPV4)
+  *     @sk_gso_max_size: Maximum GSO segment size to build
+  *     @sk_gso_max_segs: Maximum number of GSO segments
+  *     @sk_lingertime: %SO_LINGER l_linger setting
+  *     @sk_backlog: always used with the per-socket spinlock held
+  *     @sk_callback_lock: used with the callbacks in the end of this struct
+  *     @sk_error_queue: rarely used
+  *     @sk_prot_creator: sk_prot of original sock creator (see ipv6_setsockopt,
+  *                       IPV6_ADDRFORM for instance)
+  *     @sk_err: last error
+  *     @sk_err_soft: errors that don't cause failure but are the cause of a
+  *                   persistent failure not just 'timed out'
+  *     @sk_drops: raw/udp drops counter
+  *     @sk_ack_backlog: current listen backlog
+  *     @sk_max_ack_backlog: listen backlog set in listen()
+  *     @sk_priority: %SO_PRIORITY setting
+  *     @sk_cgrp_prioidx: socket group's priority map index
+  *     @sk_type: socket type (%SOCK_STREAM, etc)
+  *     @sk_protocol: which protocol this socket belongs in this network family
+  *     @sk_peer_pid: &struct pid for this socket's peer
+  *     @sk_peer_cred: %SO_PEERCRED setting
+  *     @sk_rcvlowat: %SO_RCVLOWAT setting
+  *     @sk_rcvtimeo: %SO_RCVTIMEO setting
+  *     @sk_sndtimeo: %SO_SNDTIMEO setting
+  *     @sk_rxhash: flow hash received from netif layer
+  *     @sk_incoming_cpu: record cpu processing incoming packets
+  *     @sk_txhash: computed flow hash for use on transmit
+  *     @sk_filter: socket filtering instructions
+  *     @sk_protinfo: private area, net family specific, when not using slab
+  *     @sk_timer: sock cleanup timer
+  *     @sk_stamp: time stamp of last packet received
+  *     @sk_tsflags: SO_TIMESTAMPING socket options
+  *     @sk_tskey: counter to disambiguate concurrent tstamp requests
+  *     @sk_socket: Identd and reporting IO signals
+  *     @sk_user_data: RPC layer private data
+  *     @sk_frag: cached page frag
+  *     @sk_peek_off: current peek_offset value
+  *     @sk_send_head: front of stuff to transmit
+  *     @sk_security: used by security modules
+  *     @sk_mark: generic packet mark
+  *     @sk_classid: this socket's cgroup classid
+  *     @sk_cgrp: this socket's cgroup-specific proto data
+  *     @sk_write_pending: a write to stream socket waits to start
+  *     @sk_state_change: callback to indicate change in the state of the sock
+  *     @sk_data_ready: callback to indicate there is data to be processed
+  *     @sk_write_space: callback to indicate there is bf sending space available
+  *     @sk_error_report: callback to indicate errors (e.g. %MSG_ERRQUEUE)
+  *     @sk_backlog_rcv: callback to process the backlog
+  *     @sk_destruct: called at sock freeing time, i.e. when all refcnt == 0
+ */
+struct sock {
+        /*
+         * Now struct inet_timewait_sock also uses sock_common, so please just
+         * don't add nothing before this first member (__sk_common) --acme
+         */
+        struct sock_common      __sk_common;
+#define sk_node                 __sk_common.skc_node
+#define sk_nulls_node           __sk_common.skc_nulls_node
+#define sk_refcnt               __sk_common.skc_refcnt
+#define sk_tx_queue_mapping     __sk_common.skc_tx_queue_mapping
+
+#define sk_dontcopy_begin       __sk_common.skc_dontcopy_begin
+#define sk_dontcopy_end         __sk_common.skc_dontcopy_end
+#define sk_hash                 __sk_common.skc_hash
+#define sk_portpair             __sk_common.skc_portpair
+#define sk_num                  __sk_common.skc_num
+#define sk_dport                __sk_common.skc_dport
+#define sk_addrpair             __sk_common.skc_addrpair
+#define sk_daddr                __sk_common.skc_daddr
+#define sk_rcv_saddr            __sk_common.skc_rcv_saddr
+#define sk_family               __sk_common.skc_family
+#define sk_state                __sk_common.skc_state
+#define sk_reuse                __sk_common.skc_reuse
+#define sk_reuseport            __sk_common.skc_reuseport
+#define sk_ipv6only             __sk_common.skc_ipv6only
+#define sk_bound_dev_if         __sk_common.skc_bound_dev_if
+#define sk_bind_node            __sk_common.skc_bind_node
+#define sk_prot                 __sk_common.skc_prot
+#define sk_net                  __sk_common.skc_net
+#define sk_v6_daddr             __sk_common.skc_v6_daddr
+#define sk_v6_rcv_saddr __sk_common.skc_v6_rcv_saddr
+#define sk_cookie               __sk_common.skc_cookie
+
+        socket_lock_t           sk_lock;
+        struct sk_buff_head     sk_receive_queue;
+        /*
+         * The backlog queue is special, it is always used with
+         * the per-socket spinlock held and requires low latency
+         * access. Therefore we special case it's implementation.
+         * Note : rmem_alloc is in this structure to fill a hole
+         * on 64bit arches, not because its logically part of
+         * backlog.
+         */
+        struct {
+                atomic_t        rmem_alloc;
+                int             len;
+                struct sk_buff  *head;
+                struct sk_buff  *tail;
+        } sk_backlog;
+#define sk_rmem_alloc sk_backlog.rmem_alloc
+        int                     sk_forward_alloc;
+#ifdef CONFIG_RPS
+        __u32                   sk_rxhash;
+#endif
+        u16                     sk_incoming_cpu;
+        /* 16bit hole
+         * Warned : sk_incoming_cpu can be set from softirq,
+         * Do not use this hole without fully understanding possible issues.
+         */
+
+        __u32                   sk_txhash;
+#ifdef CONFIG_NET_RX_BUSY_POLL
+        unsigned int            sk_napi_id;
+        unsigned int            sk_ll_usec;
+#endif
+        atomic_t                sk_drops;
+        int                     sk_rcvbuf;
+
+        struct sk_filter __rcu  *sk_filter;
+        struct socket_wq __rcu  *sk_wq;
+
+#ifdef CONFIG_XFRM
+        struct xfrm_policy      *sk_policy[2];
+#endif
+        unsigned long           sk_flags;
+        struct dst_entry        *sk_rx_dst;
+        struct dst_entry __rcu  *sk_dst_cache;
+        spinlock_t              sk_dst_lock;
+        atomic_t                sk_wmem_alloc;
+        atomic_t                sk_omem_alloc;
+        int                     sk_sndbuf;
+        struct sk_buff_head     sk_write_queue;
+        kmemcheck_bitfield_begin(flags);
+        unsigned int            sk_shutdown  : 2,
+                                sk_no_check_tx : 1,
+                                sk_no_check_rx : 1,
+                                sk_userlocks : 4,
+                                sk_protocol  : 8,
+#define SK_PROTOCOL_MAX U8_MAX
+                                sk_type      : 16;
+        kmemcheck_bitfield_end(flags);
+        int                     sk_wmem_queued;
+        gfp_t                   sk_allocation;
+        u32                     sk_pacing_rate; /* bytes per second */
+        u32                     sk_max_pacing_rate;
+        netdev_features_t       sk_route_caps;
+        netdev_features_t       sk_route_nocaps;
+        int                     sk_gso_type;
+        unsigned int            sk_gso_max_size;
+        u16                     sk_gso_max_segs;
+        int                     sk_rcvlowat;
+        unsigned long           sk_lingertime;
+        struct sk_buff_head     sk_error_queue;
+        struct proto            *sk_prot_creator;
+        rwlock_t                sk_callback_lock;
+        int                     sk_err,
+                                sk_err_soft;
+        u32                     sk_ack_backlog;
+        u32                     sk_max_ack_backlog;
+        __u32                   sk_priority;
+#if IS_ENABLED(CONFIG_CGROUP_NET_PRIO)
+        __u32                   sk_cgrp_prioidx;
+#endif
+        struct pid              *sk_peer_pid;
+        const struct cred       *sk_peer_cred;
+        long                    sk_rcvtimeo;
+        long                    sk_sndtimeo;
+        void                    *sk_protinfo;
+        struct timer_list       sk_timer;
+        ktime_t                 sk_stamp;tipc_family_ops
+        u16                     sk_tsflags;
+        u32                     sk_tskey;
+        struct socket           *sk_socket;
+        void                    *sk_user_data;
+        struct page_frag        sk_frag;
+        struct sk_buff          *sk_send_head;
+        __s32                   sk_peek_off;
+        int                     sk_write_pending;
+#ifdef CONFIG_SECURITY
+        void                    *sk_security;
+#endif
+        __u32                   sk_mark;
+        u32                     sk_classid;
+        struct cg_proto         *sk_cgrp;
+        void                    (*sk_state_change)(struct sock *sk);
+        void                    (*sk_data_ready)(struct sock *sk);
+        void                    (*sk_write_space)(struct sock *sk);
+        void                    (*sk_error_report)(struct sock *sk);
+        int                     (*sk_backlog_rcv)(struct sock *sk,
+                                                  struct sk_buff *skb);
+        void                    (*sk_destruct)(struct sock *sk);
+};
+
+
+struct proto_ops {
+        int             family;
+        struct module   *owner;
+        int             (*release)   (struct socket *sock);
+        int             (*bind)      (struct socket *sock,
+                                      struct sockaddr *myaddr,
+                                      int sockaddr_len);
+        int             (*connect)   (struct socket *sock,
+                                      struct sockaddr *vaddr,
+                                      int sockaddr_len, int flags);
+        int             (*socketpair)(struct socket *sock1,
+                                      struct socket *sock2);
+        int             (*accept)    (struct socket *sock,
+                                      struct socket *newsock, int flags);
+        int             (*getname)   (struct socket *sock,
+                                      struct sockaddr *addr,
+                                      int *sockaddr_len, int peer);
+        unsigned int    (*poll)      (struct file *file, struct socket *sock,
+                                      struct poll_table_struct *wait);
+        int             (*ioctl)     (struct socket *sock, unsigned int cmd,
+                                      unsigned long arg);
+#ifdef CONFIG_COMPAT
+        int             (*compat_ioctl) (struct socket *sock, unsigned int cmd,
+                                      unsigned long arg);
+#endif
+        int             (*listen)    (struct socket *sock, int len);
+        int             (*shutdown)  (struct socket *sock, int flags);
+        int             (*setsockopt)(struct socket *sock, int level,
+                                      int optname, char __user *optval, unsigned int optlen);
+        int             (*getsockopt)(struct socket *sock, int level,
+                                      int optname, char __user *optval, int __user *optlen);
+#ifdef CONFIG_COMPAT
+        int             (*compat_setsockopt)(struct socket *sock, int level,
+                                      int optname, char __user *optval, unsigned int optlen);
+        int             (*compat_getsockopt)(struct socket *sock, int level,
+                                      int optname, char __user *optval, int __user *optlen);
+#endif
+        int             (*sendmsg)   (struct socket *sock, struct msghdr *m,
+                                      size_t total_len);
+        /* Notes for implementing recvmsg:
+         * ===============================
+         * msg->msg_namelen should get updated by the recvmsg handlers
+         * iff msg_name != NULL. It is by default 0 to prevent
+         * returning uninitialized memory to user space.  The recvfrom
+         * handlers can assume that msg.msg_name is either NULL or has
+         * a minimum size of sizeof(struct sockaddr_storage).
+         */
+        int             (*recvmsg)   (struct socket *sock, struct msghdr *m,
+                                      size_t total_len, int flags);
+        int             (*mmap)      (struct file *file, struct socket *sock,
+                                      struct vm_area_struct * vma);
+        ssize_t         (*sendpage)  (struct socket *sock, struct page *page,
+                                      int offset, size_t size, int flags);
+        ssize_t         (*splice_read)(struct socket *sock,  loff_t *ppos,
+                                       struct pipe_inode_info *pipe, size_t len, unsigned int flags);
+        int             (*set_peek_off)(struct sock *sk, int val);
+};
+
+```
+
+A: The relationship of layout of socket:
+
+```
+struct socket {}
+----------------
+				|
+				V
+struct sock {}
+----------------
+
 ```
 
 2. Why need to create a socket?
