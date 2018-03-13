@@ -347,6 +347,37 @@ int main(void)
 
 Q:
 1. What's the things the socket created?
+
+A: Please refer to Q 10, there add key structure below:
+```
+/**
+ *  struct socket - general BSD socket
+ *  @state: socket state (%SS_CONNECTED, etc)
+ *  @type: socket type (%SOCK_STREAM, etc)
+ *  @flags: socket flags (%SOCK_ASYNC_NOSPACE, etc)
+ *  @ops: protocol specific socket operations
+ *  @file: File back pointer for gc
+ *  @sk: internal networking protocol agnostic socket representation
+ *  @wq: wait queue for several uses
+ */
+struct socket {
+        socket_state            state;
+
+        kmemcheck_bitfield_begin(type);
+        short                   type;
+        kmemcheck_bitfield_end(type);
+
+        unsigned long           flags;
+
+        struct socket_wq __rcu  *wq;
+
+        struct file             *file;
+        struct sock             *sk;
+        const struct proto_ops  *ops;
+};
+
+```
+
 2. Why need to create a socket?
 3. What's the meaning?
 4. Why need to bind a socket with a port or port name(TIPC)?
