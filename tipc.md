@@ -368,7 +368,7 @@ A:
 SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
 	sys_socket
 	  |
-		|---> SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
+  	|---> SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
 						sock_create
 							__sock_create
 								sock_alloc /*create inode in vfs*/
