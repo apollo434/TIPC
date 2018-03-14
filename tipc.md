@@ -1102,6 +1102,43 @@ static int tipc_l2_rcv_msg(struct sk_buff *buf, struct net_device *dev,
 
 The tipc_rcv() is the entry into tipc protocol stack from l2.
 
+/**
+ * tipc_l2_send_msg - send a TIPC packet out over an L2 interface
+ * @buf: the packet to be sent
+ * @b_ptr: the bearer through which the packet is to be sent
+ * @dest: peer destination address
+ */
+int tipc_l2_send_msg(struct net *net, struct sk_buff *buf,
+                     struct tipc_bearer *b, struct tipc_media_addr *dest)
+{
+        struct sk_buff *clone;
+        struct net_device *dev;
+        int delta;
+
+        dev = (struct net_device *)rcu_dereference_rtnl(b->media_ptr);
+        if (!dev)
+                return 0;
+
+        clone = skb_clone(buf, GFP_ATOMIC);
+        if (!clone)
+                return 0;
+
+        delta = dev->hard_header_len - skb_headroom(buf);
+        if ((delta > 0) &&
+            pskb_expand_head(clone, SKB_DATA_ALIGN(delta), 0, GFP_ATOMIC)) {
+                kfree_skb(clone);
+                return 0;
+        }    
+
+        skb_reset_network_header(clone);
+        clone->dev = dev;
+        clone->protocol = htons(ETH_P_TIPC);
+        dev_hard_header(clone, dev, ETH_P_TIPC, dest->value,
+                        dev->dev_addr, clone->len);
+        dev_queue_xmit(clone);
+        return 0;
+}
+
 ```
 
 15. Regarding neighbor discovery, how and what to do about it?
@@ -1180,5 +1217,84 @@ static struct tipc_media * const media_info_array[] = {
 		tipc_addr_string_fill(addr_string, disc_domain), priority);
 	return res;
 }
+
+```
+
+16. Regarding inquire and subscrib, how to?
+
+```
+From the tipc protocol:
+TIPC also provides a mechanism for inquiring or subscribing for the availability
+of port names or ranges of port names.
+
+And from the tipc demo:
+
+void wait_for_server(struct tipc_name* name,int wait)
+{
+        struct sockaddr_tipc topsrv;
+        struct tipc_subscr subscr = {{name->type,name->instance,name->instance},
+                                     wait,TIPC_SUB_SERVICE,{}};
+        struct tipc_event event;
+
+        int sd = socket (AF_TIPC, SOCK_SEQPACKET,0);
+        assert(sd > 0);
+
+        memset(&topsrv,0,sizeof(topsrv));
+		topsrv.family = AF_TIPC;
+        topsrv.addrtype = TIPC_ADDR_NAME;
+        topsrv.addr.name.name.type = TIPC_TOP_SRV;
+        topsrv.addr.name.name.instance = TIPC_TOP_SRV;
+
+        /* Connect to topology server: */
+
+        if (0 > connect(sd,(struct sockaddr*)&topsrv,sizeof(topsrv))){
+                perror("failed to connect to topology server");
+                exit(1);
+        }
+        if (send(sd,&subscr,sizeof(subscr),0) != sizeof(subscr)){
+                perror("failed to send subscription");
+                exit(1);
+        }
+        /* Now wait for the subscription to fire: */
+        if (recv(sd,&event,sizeof(event),0) != sizeof(event)){
+                perrork("Failed to receive event");
+                exit(1);
+        }
+        if (event.event != TIPC_PUBLISHED){
+                printf("Server %u,%u not published within %u [s]\n",
+                       name->type,name->instance,wait/1000);
+                exit(1);
+        }
+        close(sd);
+}
+```
+17. This function illustrate how to inquire.
+Thus, where is TIPC_TOP_SRV?
+
+```
+(include/uapi/linux/tipc.h)
+#define TIPC_TOP_SRV		1	/* topology service name type */
+
+/*
+ * Application-accessible port name types
+ */
+
+#define TIPC_CFG_SRV            0       /* configuration service name type */
+#define TIPC_TOP_SRV            1       /* topology service name type */
+#define TIPC_LINK_STATE         2       /* link state name type */
+#define TIPC_RESERVED_TYPES     64      /* lowest user-publishable name type */
+
+tipc_init_net() -> tipc_subsrc_start()
+
+tipc_init_net
+	tipc_subsrc_start
+		tipc_server_start
+			tipc_open_listening_sock
+				tipc_register_callbacks
+					sk->sk_data_ready = sock_data_ready()
+					sk->sk_write_space = sock_write_space()
+
+A important idea of current tipc server version is:
+It use sk_data_ready callback to queue a work, then transfer the its work from BH context to process context.
 
 ```
