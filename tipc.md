@@ -1287,12 +1287,52 @@ Thus, where is TIPC_TOP_SRV?
 tipc_init_net() -> tipc_subsrc_start()
 
 tipc_init_net
-	tipc_subsrc_start
+	tipc_subscr_start
 		tipc_server_start
 			tipc_open_listening_sock
+				tipc_create_listen_sock
+>>>
+					case SOCK_SEQPACKET:
+						con->rx_action = tipc_accept_from_sock
+		>>>>
+					static int tipc_accept_from_sock(struct tipc_conn *con)
+					{
+						...
+						/* Wake up receive process in case of 'SYN+' message */
+						newsock->sk->sk_data_ready(newsock->sk);
+						...
+					}
+		>>>>				
+						kernel_bind()
+							tipc_bind()
+								tipc_sk_publish()
+									tipc_nametbl_publish()
+										tipc_nametbl_insert_publ()
+										tipc_named_publish()
+										tipc_named_process_backlog()
+						 kernel_listen()
+>>>
 				tipc_register_callbacks
-					sk->sk_data_ready = sock_data_ready()
-					sk->sk_write_space = sock_write_space()
+					sk->sk_data_ready = sock_data_ready();
+>>>
+/**
+ * tipc_data_ready - wake up threads to indicate messages have been received
+ * @sk: socket
+ * @len: the length of messages
+ */
+static void tipc_data_ready(struct sock *sk)
+{
+        struct socket_wq *wq;
+
+        rcu_read_lock();
+        wq = rcu_dereference(sk->sk_wq);
+        if (wq_has_sleeper(wq))
+                wake_up_interruptible_sync_poll(&wq->wait, POLLIN |
+                                                POLLRDNORM | POLLRDBAND);
+        rcu_read_unlock();
+}
+>>>					
+
 
 A important idea of current tipc server version is:
 It use sk_data_ready callback to queue a work, then transfer the its work from BH context to process context.
