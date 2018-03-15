@@ -1304,14 +1304,14 @@ tipc_init_net
 					}
 		>>>>				
 						kernel_bind()
------------------Insert name table-------------------
+------------------------------------------------Insert name table----------------------------------------------------------
 							tipc_bind()
 								tipc_sk_publish()
 									tipc_nametbl_publish()
 										tipc_nametbl_insert_publ()
 										tipc_named_publish()
 										tipc_named_process_backlog()
-------------------send it via unicast----------------										
+-------------------------------------------------send it via unicast----------------------------------------------------------										
 										named_cluster_distribute()
 											tipc_link_xmit_skb()
 												tipc_link_xmit()
@@ -1324,7 +1324,7 @@ tipc_init_net
 								bcast.c:	bcbearer->media.send_msg = tipc_bcbearer_send,
 								udp_media.c:	.send_msg	= tipc_udp_send_msg,
 								>>>>>>
------------------------------------------------------------------------								
+-------------------------------------------------------------------------------------------------------------------------------------------------								
 						 kernel_listen()
 >>>
 				tipc_register_callbacks
