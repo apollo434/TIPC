@@ -1387,4 +1387,281 @@ git://git.kernel.org/pub/scm/linux/kernel/git/shemminger/iproute2.git
 Later, I will look into TIPC with latest version
 ---
 
-19.
+19. How to let other nodes know a new node exist?
+
+```
+/*
+In tipc protocol:
+When a node is started it must make the rest of the cluster aware of its existence,
+and itself learn the topology of the cluster. Once a neighbouring node has been
+detected on a bearer, a signalling link is established towards it.
+
+Thus, when and how does one node let other ones to know itself.
+
+tipc_enable_bearer() will create a tipc_bearer and broadcast its existence.
+*/
+
+(net/tipc/bearer.c)
+/**
+ * tipc_enable_bearer - enable bearer with the given name
+ */
+static int tipc_enable_bearer(struct net *net, const char *name,
+                              u32 disc_domain, u32 priority,
+                              struct nlattr *attr[])
+{
+        struct tipc_net *tn = net_generic(net, tipc_net_id);
+>>>>>>>>
+struct tipc_net {
+        u32 own_addr;
+        int net_id;
+        int random;
+
+        /* Node table and node list */
+        spinlock_t node_list_lock;
+        struct hlist_head node_htable[NODE_HTABLE_SIZE];
+        struct list_head node_list;
+        u32 num_nodes;
+        u32 num_links;
+
+        /* Bearer list */
+        struct tipc_bearer __rcu *bearer_list[MAX_BEARERS + 1];
+
+        /* Broadcast link */
+        struct tipc_bcbearer *bcbearer;
+        struct tipc_bclink *bclink;
+        struct tipc_link *bcl;
+
+        /* Socket hash table */
+        struct rhashtable sk_rht;
+
+        /* Name table */
+        spinlock_t nametbl_lock;   
+        struct name_table *nametbl;
+
+        /* Topology subscription server */
+        struct tipc_server *topsrv;
+        atomic_t subscription_count;
+};
+>>>>>>>>				
+        struct tipc_bearer *b_ptr;
+>>>>>>>>
+/**
+ * struct tipc_bearer - Generic TIPC bearer structure
+ * @media_ptr: pointer to additional media-specific information about bearer
+ * @mtu: max packet size bearer can support
+ * @addr: media-specific address associated with bearer
+ * @name: bearer name (format = media:interface)
+ * @media: ptr to media structure associated with bearer
+ * @bcast_addr: media address used in broadcasting
+ * @rcu: rcu struct for tipc_bearer
+ * @priority: default link priority for bearer
+ * @window: default window size for bearer
+ * @tolerance: default link tolerance for bearer
+ * @domain: network domain to which links can be established
+ * @identity: array index of this bearer within TIPC bearer array
+ * @link_req: ptr to (optional) structure making periodic link setup requests
+ * @net_plane: network plane ('A' through 'H') currently associated with bearer
+ * @nodes: indicates which nodes in cluster can be reached through bearer
+ *
+ * Note: media-specific code is responsible for initialization of the fields
+ * indicated below when a bearer is enabled; TIPC's generic bearer code takes
+ * care of initializing all other fields.
+ */     
+struct tipc_bearer {
+        void __rcu *media_ptr;                  /* initalized by media */
+        u32 mtu;                                /* initalized by media */
+        struct tipc_media_addr addr;            /* initalized by media */
+        char name[TIPC_MAX_BEARER_NAME];
+        struct tipc_media *media;
+        struct tipc_media_addr bcast_addr;
+        struct rcu_head rcu;
+        u32 priority;   
+        u32 window;
+        u32 tolerance;
+        u32 domain;     
+        u32 identity;
+        struct tipc_link_req *link_req;
+        char net_plane;
+        struct tipc_node_map nodes;
+};  
+>>>>>>>>				
+        struct tipc_media *m_ptr;
+>>>>>>>>
+/**
+ * struct tipc_media - Media specific info exposed to generic bearer layer
+ * @send_msg: routine which handles buffer transmission
+ * @enable_media: routine which enables a media
+ * @disable_media: routine which disables a media
+ * @addr2str: convert media address format to string
+ * @addr2msg: convert from media addr format to discovery msg addr format
+ * @msg2addr: convert from discovery msg addr format to media addr format
+ * @raw2addr: convert from raw addr format to media addr format
+ * @priority: default link (and bearer) priority
+ * @tolerance: default time (in ms) before declaring link failure
+ * @window: default window (in packets) before declaring link congestion
+ * @type_id: TIPC media identifier
+ * @hwaddr_len: TIPC media address len
+ * @name: media name
+ */  
+struct tipc_media {
+        int (*send_msg)(struct net *net, struct sk_buff *buf,
+                        struct tipc_bearer *b_ptr,
+                        struct tipc_media_addr *dest);
+        int (*enable_media)(struct net *net, struct tipc_bearer *b_ptr,
+                            struct nlattr *attr[]);
+        void (*disable_media)(struct tipc_bearer *b_ptr);
+        int (*addr2str)(struct tipc_media_addr *addr,
+                        char *strbuf,
+                        int bufsz);
+        int (*addr2msg)(char *msg, struct tipc_media_addr *addr);
+        int (*msg2addr)(struct tipc_bearer *b,
+                        struct tipc_media_addr *addr,
+                        char *msg);
+        int (*raw2addr)(struct tipc_bearer *b,
+                        struct tipc_media_addr *addr,
+                        char *raw);
+        u32 priority;
+        u32 tolerance;
+        u32 window;
+        u32 type_id;
+        u32 hwaddr_len;
+        char name[TIPC_MAX_MEDIA_NAME];
+};
+>>>>>>>>				
+        struct tipc_bearer_names b_names;
+
+				....
+
+				m_ptr = tipc_media_find(b_names.media_name);
+>>>>>>>>
+static struct tipc_media * const media_info_array[] = {
+        &eth_media_info,
+#ifdef CONFIG_TIPC_MEDIA_IB
+        &ib_media_info,
+#endif
+#ifdef CONFIG_TIPC_MEDIA_UDP
+        &udp_media_info,
+#endif
+        NULL
+};
+
+/* Ethernet media registration info */  
+struct tipc_media eth_media_info = {
+        .send_msg       = tipc_l2_send_msg,
+        .enable_media   = tipc_enable_l2_media,
+        .disable_media  = tipc_disable_l2_media,
+        .addr2str       = tipc_eth_addr2str,
+        .addr2msg       = tipc_eth_addr2msg,
+        .msg2addr       = tipc_eth_msg2addr,
+        .raw2addr       = tipc_eth_raw2addr,
+        .priority       = TIPC_DEF_LINK_PRI,
+        .tolerance      = TIPC_DEF_LINK_TOL,
+        .window         = TIPC_DEF_LINK_WIN,
+        .type_id        = TIPC_MEDIA_TYPE_ETH,
+        .hwaddr_len     = ETH_ALEN,
+        .name           = "eth"
+};
+
+/* InfiniBand media registration info */
+struct tipc_media ib_media_info = {
+        .send_msg       = tipc_l2_send_msg,     
+        .enable_media   = tipc_enable_l2_media,
+        .disable_media  = tipc_disable_l2_media,
+        .addr2str       = tipc_ib_addr2str,
+        .addr2msg       = tipc_ib_addr2msg,
+        .msg2addr       = tipc_ib_msg2addr,     
+        .raw2addr       = tipc_ib_raw2addr,     
+        .priority       = TIPC_DEF_LINK_PRI,
+        .tolerance      = TIPC_DEF_LINK_TOL,
+        .window         = TIPC_DEF_LINK_WIN,
+        .type_id        = TIPC_MEDIA_TYPE_IB,
+        .hwaddr_len     = INFINIBAND_ALEN,
+        .name           = "ib"
+};
+
+struct tipc_media udp_media_info = {
+        .send_msg       = tipc_udp_send_msg,
+        .enable_media   = tipc_udp_enable,
+        .disable_media  = tipc_udp_disable,     
+        .addr2str       = tipc_udp_addr2str,    
+        .addr2msg       = tipc_udp_addr2msg,
+        .msg2addr       = tipc_udp_msg2addr,
+        .priority       = TIPC_DEF_LINK_PRI,
+        .tolerance      = TIPC_DEF_LINK_TOL,
+        .window         = TIPC_DEF_LINK_WIN,
+        .type_id        = TIPC_MEDIA_TYPE_UDP,
+        .hwaddr_len     = 0,
+        .name           = "udp"
+};
+>>>>>>>>
+				....
+
+				>>>>/*create b_ptr*/
+				b_ptr = kzalloc(sizeof(*b_ptr), GFP_ATOMIC);
+        if (!b_ptr)
+                return -ENOMEM;
+
+        strcpy(b_ptr->name, name);
+        b_ptr->media = m_ptr;
+
+				>>>>/*The important thing is raw2addr*/
+        res = m_ptr->enable_media(net, b_ptr, attr);
+        if (res) {
+                pr_warn("Bearer <%s> rejected, enable failure (%d)\n",
+                        name, -res);
+                return -EINVAL;
+        }
+
+				>>>>/*Init b_ptr*/
+        b_ptr->identity = bearer_id;
+        b_ptr->tolerance = m_ptr->tolerance;
+        b_ptr->window = m_ptr->window;
+        b_ptr->domain = disc_domain;
+        b_ptr->net_plane = bearer_id + 'A';
+        b_ptr->priority = priority;
+
+				>>>>/*broadcast bearer*/
+				res = tipc_disc_create(net, b_ptr, &b_ptr->bcast_addr);
+>>>>>>>>
+/**
+ * tipc_disc_create - create object to send periodic link setup requests
+ * @net: the applicable net namespace
+ * @b_ptr: ptr to bearer issuing requests
+ * @dest: destination address for request messages
+ * @dest_domain: network domain to which links can be established
+ *
+ * Returns 0 if successful, otherwise -errno.
+ */
+int tipc_disc_create(struct net *net, struct tipc_bearer *b_ptr,
+                     struct tipc_media_addr *dest)
+{										 
+        ......										     	
+        tipc_bearer_send(net, req->bearer_id, req->buf, &req->dest);
+				......
+}				
+>>>>>>>>				
+        if (res) {
+                bearer_disable(net, b_ptr, false);
+                pr_warn("Bearer <%s> rejected, discovery object creation failed\n",
+                        name);
+                return -EINVAL;
+        }
+
+        rcu_assign_pointer(tn->bearer_list[bearer_id], b_ptr);
+
+        pr_info("Enabled bearer <%s>, discovery domain %s, priority %u\n",
+                name,
+                tipc_addr_string_fill(addr_string, disc_domain), priority);
+        return res;				
+}
+
+
+There are important step here:
+a. enable_media
+b. broadcast discovery message
+
+```
+
+20. Why need a bearer list in tipc_net?
+
+21. 
