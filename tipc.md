@@ -1330,6 +1330,26 @@ tipc_init_net
 				tipc_register_callbacks
 					sk->sk_data_ready = sock_data_ready();
 >>>
+static void sock_data_ready(struct sock *sk)
+{
+        struct tipc_conn *con;
+
+        read_lock(&sk->sk_callback_lock);
+        con = sock2con(sk);
+        if (con && test_bit(CF_CONNECTED, &con->flags)) {
+                conn_get(con);
+                if (!queue_work(con->server->rcv_wq, &con->rwork))
+                        conn_put(con);
+        }
+        read_unlock(&sk->sk_callback_lock);
+}
+
+
+sock_data_ready()
+ -> queue_work()
+  -> queue_work_on()
+	 -> __queue_work()
+
 /**
  * tipc_data_ready - wake up threads to indicate messages have been received
  * @sk: socket
@@ -1357,10 +1377,14 @@ It use sk_data_ready callback to queue a work, then transfer the its work from B
 18. The Git hub:
 
 git://git.kernel.org/pub/scm/linux/kernel/git/davem/net-next.git
+
 git://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git
+
 git://git.kernel.org/pub/scm/linux/kernel/git/shemminger/iproute2.git
 
 **NOTE**
 ---
 Later, I will look into TIPC with latest version
 ---
+
+19.

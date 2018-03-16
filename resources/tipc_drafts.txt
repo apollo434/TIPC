@@ -1,0 +1,2765 @@
+Based on 4.1.36 
+We will answer some crucial questions here.
+
+----------------------------------------------------------------------------------
+
+The bearer of the tipc protocol is l2 (Ethernet) or l3(TCP UDP).
+How does the bearer setup ?
+How does the tipc interact with the bearer?
+
+tipc_init() -> tipc_bearer_setup()
+
+int tipc_bearer_setup(void)
+{
+	int err;
+
+	err = register_netdevice_notifier(&notifier);
+	if (err)
+		return err;
+	dev_add_pack(&tipc_packet_type);
+	return 0;
+}
+
+static struct packet_type tipc_packet_type __read_mostly = {
+	.type = htons(ETH_P_TIPC),
+	.func = tipc_l2_rcv_msg,
+};
+
+
+static int tipc_l2_rcv_msg(struct sk_buff *buf, struct net_device *dev,
+			   struct packet_type *pt, struct net_device *orig_dev)
+{
+	struct tipc_bearer *b_ptr;
+
+	rcu_read_lock();
+	b_ptr = rcu_dereference_rtnl(dev->tipc_ptr);
+	if (likely(b_ptr)) {
+		if (likely(buf->pkt_type <= PACKET_BROADCAST)) {
+			buf->next = NULL;
+			tipc_rcv(dev_net(dev), buf, b_ptr);
+			rcu_read_unlock();
+			return NET_RX_SUCCESS;
+		}
+	}
+	rcu_read_unlock();
+
+	kfree_skb(buf);
+	return NET_RX_DROP;
+}
+
+The tipc_rcv() is the entry into tipc protocol stack from l2.
+
+--------------------------------------------------------------------------
+
+Tipc has its own address family: AF_TIPC.
+static const struct net_proto_family tipc_family_ops = {
+	.owner		= THIS_MODULE,
+	.family		= AF_TIPC,
+	.create		= tipc_sk_create
+};
+
+When we create a tipc socket, we still need to specify a socket type.
+In tipc_sk_create(), the sock->ops will be set to different value based on the
+socket type.
+
+
+------------------------------------------------------------------------------
+
+From the tipc protocol:
+TIPC also provides a mechanism for inquiring or subscribing for the availability 
+of port names or ranges of port names.
+
+And from the tipc demo:
+
+void wait_for_server(struct tipc_name* name,int wait)
+{
+        struct sockaddr_tipc topsrv;
+        struct tipc_subscr subscr = {{name->type,name->instance,name->instance},
+                                     wait,TIPC_SUB_SERVICE,{}};
+        struct tipc_event event;
+
+        int sd = socket (AF_TIPC, SOCK_SEQPACKET,0);
+        assert(sd > 0);
+
+        memset(&topsrv,0,sizeof(topsrv));
+		topsrv.family = AF_TIPC;
+        topsrv.addrtype = TIPC_ADDR_NAME;
+        topsrv.addr.name.name.type = TIPC_TOP_SRV;
+        topsrv.addr.name.name.instance = TIPC_TOP_SRV;
+
+        /* Connect to topology server: */
+
+        if (0 > connect(sd,(struct sockaddr*)&topsrv,sizeof(topsrv))){
+                perror("failed to connect to topology server");
+                exit(1);
+        }
+        if (send(sd,&subscr,sizeof(subscr),0) != sizeof(subscr)){
+                perror("failed to send subscription");
+                exit(1);
+        }
+        /* Now wait for the subscription to fire: */
+        if (recv(sd,&event,sizeof(event),0) != sizeof(event)){
+                perror("Failed to receive event");
+                exit(1);
+        }
+        if (event.event != TIPC_PUBLISHED){
+                printf("Server %u,%u not published within %u [s]\n",
+                       name->type,name->instance,wait/1000);
+                exit(1);
+        }
+        close(sd);
+}
+
+This function illustrate how to inquire.
+Thus, where is TIPC_TOP_SRV? 
+
+tipc_init_net() -> tipc_subsrc_start()
+
+A important idea of current tipc server version is:
+It use sk_data_ready callback to queue a work, then transfer the its work from
+BH context to process context.
+
+
+----------------------------------------------------------------------------
+
+In tipc protocol:
+When a node is started it must make the rest of the cluster aware of its existence, 
+and itself learn the topology of the cluster. Once a neighbouring node has been
+detected on a bearer, a signalling link is established towards it. 
+
+Thus, when and how does one node let other ones to know itself.
+
+tipc_enable_bearer() will create a tipc_bearer and broadcast its existence.
+
+static int tipc_enable_bearer(struct net *net, const char *name,
+			      u32 disc_domain, u32 priority,
+			      struct nlattr *attr[])
+{
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+	struct tipc_bearer *b_ptr;
+	struct tipc_media *m_ptr;
+	>>>>>
+	m_ptr = tipc_media_find(b_names.media_name);
+>>>>>>>>>>>>>
+The possible medias.
+
+static struct tipc_media * const media_info_array[] = {
+	&eth_media_info,
+#ifdef CONFIG_TIPC_MEDIA_IB
+	&ib_media_info,
+#endif
+#ifdef CONFIG_TIPC_MEDIA_UDP
+	&udp_media_info,
+#endif
+	NULL
+};
+>>>>>>>>>>>>>>
+	>>>>>//create a tipc_bear
+	b_ptr = kzalloc(sizeof(*b_ptr), GFP_ATOMIC);
+	if (!b_ptr)
+		return -ENOMEM;
+
+	strcpy(b_ptr->name, name);
+	b_ptr->media = m_ptr;
+	res = m_ptr->enable_media(net, b_ptr, attr);
+	if (res) {
+		pr_warn("Bearer <%s> rejected, enable failure (%d)\n",
+			name, -res);
+		return -EINVAL;
+	}
+
+	b_ptr->identity = bearer_id;
+	b_ptr->tolerance = m_ptr->tolerance;
+	b_ptr->window = m_ptr->window;
+	b_ptr->domain = disc_domain;
+	b_ptr->net_plane = bearer_id + 'A';
+	b_ptr->priority = priority;
+
+	//broadcast its existence
+	res = tipc_disc_create(net, b_ptr, &b_ptr->bcast_addr);
+	if (res) {
+		bearer_disable(net, b_ptr, false);
+		pr_warn("Bearer <%s> rejected, discovery object creation failed\n",
+			name);
+		return -EINVAL;
+	}
+
+	rcu_assign_pointer(tn->bearer_list[bearer_id], b_ptr);
+
+	pr_info("Enabled bearer <%s>, discovery domain %s, priority %u\n",
+		name,
+		tipc_addr_string_fill(addr_string, disc_domain), priority);
+	return res;
+}
+
+There are important step here:
+a. enable_media
+b. broadcast discovery message
+
+Let's look at how does echo of them work.
+
+For ethernet bearer, its enable_media callback is tipc_enable_l2_media()
+
+int tipc_enable_l2_media(struct net *net, struct tipc_bearer *b,
+			 struct nlattr *attr[])
+{
+	struct net_device *dev;
+	char *driver_name = strchr((const char *)b->name, ':') + 1;
+
+	/* Find device with specified name */
+	dev = dev_get_by_name(net, driver_name);
+	if (!dev)
+		return -ENODEV;
+
+	/* Associate TIPC bearer with L2 bearer */
+	rcu_assign_pointer(b->media_ptr, dev);
+	memset(&b->bcast_addr, 0, sizeof(b->bcast_addr));
+	memcpy(b->bcast_addr.value, dev->broadcast, b->media->hwaddr_len);
+	b->bcast_addr.media_id = b->media->type_id;
+	b->bcast_addr.broadcast = 1;
+	b->mtu = dev->mtu;
+	b->media->raw2addr(b, &b->addr, (char *)dev->dev_addr);
+	rcu_assign_pointer(dev->tipc_ptr, b);
+	return 0;
+}
+
+The NIC's MAC is a copied to tipc_bearer->addr.
+We also see that the broadcast addr of bearer is set here which will be used to send 
+discovery broadcast.
+	//broadcast its existence
+	res = tipc_disc_create(net, b_ptr, &b_ptr->bcast_addr);
+
+What information is contained in the discovery broadcast and what is it used for ?
+
+tipc_disc_create() -> tipc_disc_init_msg() 
+
+static void tipc_disc_init_msg(struct net *net, struct sk_buff *buf, u32 type,
+			       struct tipc_bearer *b_ptr)
+{
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+	struct tipc_msg *msg;
+	u32 dest_domain = b_ptr->domain;
+
+	msg = buf_msg(buf);
+	tipc_msg_init(tn->own_addr, msg, LINK_CONFIG, type,
+		      MAX_H_SIZE, dest_domain);
+	msg_set_non_seq(msg, 1);
+	msg_set_node_sig(msg, tn->random);
+	msg_set_node_capabilities(msg, 0);
+	msg_set_dest_domain(msg, dest_domain);
+	msg_set_bc_netid(msg, tn->net_id);
+	b_ptr->media->addr2msg(msg_media_addr(msg), &b_ptr->addr);
+}
+
+The message user is LINK_CONFIG and type is DSC_REQ_MSG.
+The MAC is carried by the message.
+
+When the DSC_REQ_MSG is received by the nodes which is in the same cluster.
+
+tipc_rcv() -> tipc_disc_rcv()
+
+bearer->media->msg2addr(bearer, &maddr, msg_media_addr(msg));
+
+The MAC is copied out from the msg.
+
+When the logic judge that the addr is acceptable, 
+	if (accept_addr) {
+		if (!link)
+			link = tipc_link_create(node, bearer, &maddr);
+		if (link) {
+			memcpy(&link->media_addr, &maddr, sizeof(maddr));
+			tipc_link_reset(link);
+		} else {
+			respond = false;
+		}
+	}
+A link is setup and the tipc_link->media_addr is set.
+And a response message is sent.
+	if (respond && (mtyp == DSC_REQ_MSG)) {
+		rbuf = tipc_buf_acquire(MAX_H_SIZE);
+		if (rbuf) {
+			tipc_disc_init_msg(net, rbuf, DSC_RESP_MSG, bearer);
+			tipc_bearer_send(net, bearer->identity, rbuf, &maddr);
+			kfree_skb(rbuf);
+		}
+	}
+The MAC of this node is also carried by the msg.
+tipc_disc_rcv() also handles DSC_RESP_MSG, The difference is that the response message
+will not be sent again.
+
+The tipc_link is built on tipc_bearer.
+The tipc_bearer is a abstraction of the media which is used to communicate with others, 
+it could be a ethernet, a infiniteband or a udp socket
+The link is a abstraction of the connection between two bearer who both know echo other.
+All the functions corresponding to the transmission is carried on link, including 
+congestion control.
+
+The tipc_link->media_addr is used to construct the l2 frame.
+
+tipc_l2_send_msg()
+>>>>
+	dev_hard_header(clone, dev, ETH_P_TIPC, dest->value,
+			dev->dev_addr, clone->len);
+	dev_queue_xmit(clone);
+>>>>
+
+dev_hard_header() will invoke eth_header() when the bearer media is ethernet.
+
+int eth_header(struct sk_buff *skb, struct net_device *dev,
+	       unsigned short type,
+	       const void *daddr, const void *saddr, unsigned int len)
+{
+	struct ethhdr *eth = (struct ethhdr *)skb_push(skb, ETH_HLEN);
+
+	if (type != ETH_P_802_3 && type != ETH_P_802_2)
+		eth->h_proto = htons(type);
+	else
+		eth->h_proto = htons(len);
+
+	/*
+	 *      Set the source hardware address.
+	 */
+
+	if (!saddr)
+		saddr = dev->dev_addr;
+	memcpy(eth->h_source, saddr, ETH_ALEN);
+
+	if (daddr) {
+		memcpy(eth->h_dest, daddr, ETH_ALEN);
+		return ETH_HLEN;
+	}
+
+	/*
+	 *      Anyway, the loopback-device should never use this function...
+	 */
+
+	if (dev->flags & (IFF_LOOPBACK | IFF_NOARP)) {
+		eth_zero_addr(eth->h_dest);
+		return ETH_HLEN;
+	}
+
+	return -ETH_HLEN;
+}
+
+We can see the MAC address of the local and peer node is used here.
+
+------------------------------------------------------------------------------
+About the message user
+
+According to the tipc protocol 2.0:
+3 3 2 2 2 2 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0
+1 0 9 8 7 6 5 4|3 2 1 0 9 8 7 6|5 4 3 2 1 0 9 8|7 6 5 4 3 2 1 0
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Ver | User  | Hsize |N|D|S|R|        Message Size             |
+>>>>
+
+The description:
+User: 4 bits : Message user, as described in Section 4.4.1 Payload
+messages utilize one of: LOW_IMPORTANCE, MEDIUM_IMPORTANCE, HIGH_IMPORTANCE, and 
+CRITICAL_IMPORTANCE. This indicates the message's importance as set by the to 
+the application, and determines how it should be treated in case of network or 
+node overlaod. The higher the importance, the less the risk that the message will
+be rejected or dropped during an overload situation.
+
+It seems that the message user is only related to the priority.
+According to the source code of the tipc, it should not be only that.
+Message user have two aspects:
+a. what the message is used for ? It indicates a higher layer type. There are smaller
+classes in it, message type. For example, LINK_CONFIG contains DSC_REQ_MSG and DSC_RESP_MSG.
+b. it indicates a priority which is called importance in tipc. We could get the importance 
+through msg_importance().
+
+static inline u32 msg_importance(struct tipc_msg *m)
+{
+	if (unlikely(msg_user(m) == MSG_FRAGMENTER))
+		return msg_bits(m, 9, 0, 0x7);
+	if (likely(msg_isdata(m) && !msg_errcode(m)))
+		return msg_user(m);
+	return TIPC_SYSTEM_IMPORTANCE;
+}
+
+------------------------------------------------------------------------------------------
+Before we do anything associated to the tipc, we must use tipc-config to configure the tipc module.
+A common usage is 
+tipc-config -a=1.1.1 -be=eth:eth0
+
+What is the option 'a' for?
+According to the source code of the tipc-config, we know it is for setting node addr.
+By default, it is to set the local. If we add a option 'dest', it seems to set the dest node.
+
+Before look at the set procedure, we must clear the tipc five-layer network topology.
+
+The highest layer is called tipc network, all the others is in it.
+This is the ensemble of all computers (nodes) inter-connected via TIPC, i.e., the domain 
+where any node can reach any other node by using a TIPC network address.
+
+The next level in the hierarchy is an entity called zone. This “cluster of clusters” is
+the maximum scope of location transparency within a network, i.e., the domain where any
+process can reach any other process by using a functional address rather than a network 
+addresses.
+< Here, we know that, we could use a functional address to communicate with
+others for intra-zone, but for inter-zone, we must use network address >
+
+The third level is what we call the cluster. This is a group of nodes interconnected 
+all-to-all via one or two TIPC links.
+<The all-to-all is very important, there is no forward function in the nodes. 
+A switch could help to found such a cluster>
+
+The fourth level is the individual system node, or just node. There may be up to 2047 system
+nodes in a cluster.
+< A node indicates a mechine >
+
+The lowest level is slave node. <ignore it here>
+
+All entities within a TIPC network are accessed using a TIPC network address, a 32-bit 
+value subdivided into a zone, cluster, and node field. 
+This address is internally mapped to the address type for the communication media 
+actually used, e.g., an Ethernet address or an IP-address/port number tuplet.
+
+The 1.1.1 is TIPC network address.
+
+The handle function in tipc-config is:
+
+static void set_node_addr(char *args)
+{
+	__u32 new_addr;
+	__u32 new_addr_net;
+	int tlv_space;
+
+	if (!*args) {
+		do_command(TIPC_CMD_NOOP, NULL, 0, tlv_area, sizeof(tlv_area));
+		printf("node address: %s\n", addr2str(dest));
+		return;
+	}
+
+	new_addr = str2addr(args);
+
+	confirm("change node address%s to %s? "
+		"(this will delete all links) [Y/n]\n", 
+		for_dest(), addr2str(new_addr));
+
+	new_addr_net = htonl(new_addr);
+	tlv_space = TLV_SET(tlv_area, TIPC_TLV_NET_ADDR, 
+				&new_addr_net, sizeof(new_addr_net));
+	do_command(TIPC_CMD_SET_NODE_ADDR, tlv_area, tlv_space, 
+		   tlv_area, sizeof(tlv_area));
+
+	cprintf("node address%s now set to %s\n", 
+		for_dest(), addr2str(new_addr));
+	dest = new_addr;
+}
+
+The str2addr() is used to convert the string address (1.1.1) to a 32-bits value
+The simplified procedure is:
+	sscanf(str, "%u.%u.%u%c", &zone, &cluster, &node, &dummy);
+	value = (zone << 24) | (cluster << 12) | node;
+
+do_command() sends the configure message with netlink or tipc, based on whether
+the destination address is local.
+
+------------------------------------------------------------------------------------------
+
+The discovery mechanism
+
+We have know that, when a bearer is enabled, it will send out a broadcast which carries
+its MAC. In fact, this broadcast message contains a dest_domain.
+This dest_domain could be sigle node or a cluster, etc.
+< There is no forward function in TIPC, every node in the tipc network should
+connect with echo other by any kind of bearer. When the bearer is enabled, the
+discovery message could only be received by the node that has the same kind of
+bearer >
+We could configure it through tipc-config.
+-be    =<bearer>[/<domain>[/<priority>]]]
+
+When tipc init the discovery message, the dest_domain will be used in 2 place.
+dest node and dest domain.
+
+in tipc_disc_rcv(), it will judge whether the local node is in the dest domain.
+
+A timer is also armed when we send out the discovery message.
+
+static void disc_timeout(unsigned long data)
+{
+	struct tipc_link_req *req = (struct tipc_link_req *)data;
+	int max_delay;
+
+	spin_lock_bh(&req->lock);
+
+	/* Stop searching if only desired node has been found */
+	if (tipc_node(req->domain) && req->num_nodes) {
+		req->timer_intv = TIPC_LINK_REQ_INACTIVE;
+		goto exit;
+	}
+
+	/*
+	 * Send discovery message, then update discovery timer
+	 *
+	 * Keep doubling time between requests until limit is reached;
+	 * hold at fast polling rate if don't have any associated nodes,
+	 * otherwise hold at slow polling rate
+	 */
+	tipc_bearer_send(req->net, req->bearer_id, req->buf, &req->dest);
+
+
+	req->timer_intv *= 2;
+	if (req->num_nodes)
+		max_delay = TIPC_LINK_REQ_SLOW;
+	else
+		max_delay = TIPC_LINK_REQ_FAST;
+	if (req->timer_intv > max_delay)
+		req->timer_intv = max_delay;
+
+	mod_timer(&req->timer, jiffies + req->timer_intv);
+exit:
+	spin_unlock_bh(&req->lock);
+}
+
+The only condition of stop searching is:
+	if (tipc_node(req->domain) && req->num_nodes) {
+		req->timer_intv = TIPC_LINK_REQ_INACTIVE;
+		goto exit;
+	}
+
+static inline unsigned int tipc_node(__u32 addr)
+{
+	return addr & 0xfff;
+}
+
+If the dest_domain of this bearer is a single node and we have a dest node now, stop.
+
+Otherwise, the discovery message is always being sent. The interval of sending is changing 
+based on a simple algorithm.
+
+---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+Let's talk about the most important infrastructure of TIPC, 
+the Name Translation Table.
+
+Translation from port name to socket addresses is performed transparently and 
+on-the-fly via an internal translation table, replicated on each node. When a 
+socket is bound to a port name sequence, a corresponding table entry is 
+distributed to all nodes within the binding scope, i.e., the local cluster in 
+most cases.
+
+tipc_bind() -> tipc_sk_publish() -> tipc_nametbl_publish()
+
+struct publication *tipc_nametbl_publish(struct net *net, u32 type, u32 lower,
+					 u32 upper, u32 scope, u32 port_ref,
+					 u32 key)
+{
+	struct publication *publ;
+	struct sk_buff *buf = NULL;
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+
+	spin_lock_bh(&tn->nametbl_lock);
+	if (tn->nametbl->local_publ_count >= TIPC_MAX_PUBLICATIONS) {
+		pr_warn("Publication failed, local publication limit reached (%u)\n",
+			TIPC_MAX_PUBLICATIONS);
+		spin_unlock_bh(&tn->nametbl_lock);
+		return NULL;
+	}
+
+	publ = tipc_nametbl_insert_publ(net, type, lower, upper, scope,
+					tn->own_addr, port_ref, key);
+	if (likely(publ)) {
+		tn->nametbl->local_publ_count++;
+		buf = tipc_named_publish(net, publ);
+		/* Any pending external events? */
+		tipc_named_process_backlog(net);
+	}
+	spin_unlock_bh(&tn->nametbl_lock);
+
+	if (buf)
+		named_cluster_distribute(net, buf);
+	return publ;
+}
+
+Two key steps: insert in local and distribute to others.
+
+First, we must clear the structure of the name table.
+
+tipc_net->nametbl->seq_hlist[]
+                   hash buckets
+                   [________]
+                   [________]
+                   [________] -> name_seq -> sseqs
+                   [________]     type      Array
+                   [________]              [s0 ~ s1] -> name_info
+                   [........]              [s2 ~ s3]       |
+                   [________]              [s4 ~ s5]       |
+                   [________]                              V
+                   [________]             publ -> publ -> publ -> publ -> publ
+
+
+More details could refer to tipc_nametbl_insert_publ()
+
+Binding a socket to a port name corresponds to binding it to a port number in
+other protocols, except that the port name is unique and has validity for the 
+whole cluster, not only the local node.
+
+The portname is unique in one cluster.
+Thus, there could be same protname in different cluster.
+However, why does tipc not detect the same port name sequence in the cluster?
+
+In tipc_nameseq_insert_publ()
+>>>>
+	sseq = nameseq_find_subseq(nseq, lower);
+	if (sseq) {
+
+		/* Lower end overlaps existing entry => need an exact match */
+		if ((sseq->lower != lower) || (sseq->upper != upper)) {
+			return NULL;
+		}
+
+		info = sseq->info;
+
+		/* Check if an identical publication already exists */
+		list_for_each_entry(publ, &info->zone_list, zone_list) {
+			if ((publ->ref == port) && (publ->key == key) &&
+			    (!publ->node || (publ->node == node)))
+				return NULL;
+		}
+	}
+>>>>
+
+It seems very hard to implement this.
+There is not a arbitrator in TIPC protocol.
+If two node in one cluster publish the protname at the same time and broadcast it,
+the other nodes cannot determine which is the valid one.
+
+< The uniqueness of the portname in one cluster must be ensured by the administrator 
+of the cluster >.
+
+tipc_named_publish() will build a sk_buff which carries the NAME_DISTRIBUTOR message,
+then named_cluster_distribute() send out it.
+
+void named_cluster_distribute(struct net *net, struct sk_buff *skb)
+{
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+	struct sk_buff *oskb;
+	struct tipc_node *node;
+	u32 dnode;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(node, &tn->node_list, list) {
+		dnode = node->addr;
+		if (in_own_node(net, dnode))
+			continue;
+		if (!tipc_node_active_links(node))
+			continue;
+		oskb = pskb_copy(skb, GFP_ATOMIC);
+		if (!oskb)
+			break;
+		msg_set_destnode(buf_msg(oskb), dnode);
+		tipc_link_xmit_skb(net, oskb, dnode, dnode);
+	}
+	rcu_read_unlock();
+
+	kfree_skb(skb);
+}
+
+The distributed item contain 
+struct distr_item {
+	__be32 type;
+	__be32 lower;
+	__be32 upper;
+	__be32 ref;
+	__be32 key;
+};
+The ref is port number associated with a socket in one node.
+
+
+When a node receive this message, tipc_data_input() will handle it.
+static bool tipc_data_input(struct tipc_link *link, struct sk_buff *skb)
+{
+	struct tipc_node *node = link->owner;
+	struct tipc_msg *msg = buf_msg(skb);
+	u32 dport = msg_destport(msg);
+
+	switch (msg_user(msg)) {
+	case TIPC_LOW_IMPORTANCE:
+	case TIPC_MEDIUM_IMPORTANCE:
+	case TIPC_HIGH_IMPORTANCE:
+	case TIPC_CRITICAL_IMPORTANCE:
+	case CONN_MANAGER:
+		if (tipc_skb_queue_tail(&link->inputq, skb, dport)) {
+			node->inputq = &link->inputq;
+			node->action_flags |= TIPC_MSG_EVT;
+		}
+		return true;
+	case NAME_DISTRIBUTOR:
+		node->bclink.recv_permitted = true;
+		node->namedq = &link->namedq;
+		skb_queue_tail(&link->namedq, skb);
+		if (skb_queue_len(&link->namedq) == 1)
+			node->action_flags |= TIPC_NAMED_MSG_EVT;
+		return true;
+	case MSG_BUNDLER:
+	case TUNNEL_PROTOCOL:
+	case MSG_FRAGMENTER:
+	case BCAST_PROTOCOL:
+		return false;
+	default:
+		pr_warn("Dropping received illegal msg type\n");
+		kfree_skb(skb);
+		return false;
+	};
+}
+
+
+The message is queued on tipc_node->namedq. It will be processed in tipc_node_unlock()
+
+
+-----------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------
+
+Connectionless Communication and Connection-based Communication
+
+There are two types of unicast connectionless communication, name addressed and direct 
+addressed message transport.
+The main advantage with this type of communication is that there is no need for a 
+connection setup procedure. Another is that messages can be sent from one to many 
+destionations, as well as many to one. A third one is that a destination port easily can
+move around, without the potential senders needing to be aware.
+
+The main disadvantage with this kind of communication is the lack of flow control. It is 
+very easy to overwhelm a single destination from many sources.
+
+The message type indicates the connection type.
+   Mtype   Mtype Name   Purpose
+   -----   ----------   -------
+	0       CONN_MSG     Data sent over an established connection
+	1       MCAST_MSG    Data sent to a port name sequence by multicast
+	2       NAMED_MSG    Data sent to a port name address
+	3       DIRECT_MSG   Data sent to a port id address
+
+In tipc_sk_create(), the socket type determine the sock->ops and sock original state
+
+switch (sock->type) {
+	case SOCK_STREAM:
+		ops = &stream_ops;
+		state = SS_UNCONNECTED;
+		break;
+	case SOCK_SEQPACKET:
+		ops = &packet_ops;
+		state = SS_UNCONNECTED;
+		break;
+	case SOCK_DGRAM:
+	case SOCK_RDM:
+		ops = &msg_ops;
+		state = SS_READY;
+		break;
+	default:
+		return -EPROTOTYPE;
+	}
+We could know that, SOCK_STREAM and SOCK_SEQPACKET is connection-based and
+SOCK_DGRAM and SOCK_RDM is connection-less.
+
+Next, let's see what happens in tipc_connect()?
+
+static int tipc_connect(struct socket *sock, struct sockaddr *dest,
+			int destlen, int flags)
+{
+	struct sock *sk = sock->sk;
+	struct tipc_sock *tsk = tipc_sk(sk);
+	struct sockaddr_tipc *dst = (struct sockaddr_tipc *)dest;
+	struct msghdr m = {NULL,};
+	long timeout = (flags & O_NONBLOCK) ? 0 : tsk->conn_timeout;
+	socket_state previous;
+	int res = 0;
+
+	lock_sock(sk);
+
+	/* DGRAM/RDM connect(), just save the destaddr */
+	if (sock->state == SS_READY) {
+		>>>>
+		memcpy(&tsk->remote, dest, destlen);
+		tsk->connected = 1;
+		>>>>
+	/* As the comment said, it's very easy for DGRAM and RDM, just record  the 
+	   peer address and set the tipc_sock->connected to 1
+	 */
+		goto exit;
+	}
+
+	/*
+	 * Reject connection attempt using multicast address
+	 *
+	 * Note: send_msg() validates the rest of the address fields,
+	 *       so there's no need to do it here
+	 */
+	if (dst->addrtype == TIPC_ADDR_MCAST) {
+		res = -EINVAL;
+		goto exit;
+	}
+
+	previous = sock->state;
+	switch (sock->state) {
+	case SS_UNCONNECTED:
+		/* Send a 'SYN-' to destination */
+		m.msg_name = dest;
+		m.msg_namelen = destlen;
+
+		/* If connect is in non-blocking case, set MSG_DONTWAIT to
+		 * indicate send_msg() is never blocked.
+		 */
+		if (!timeout)
+			m.msg_flags = MSG_DONTWAIT;
+
+		res = __tipc_sendmsg(sock, &m, 0);
+		if ((res < 0) && (res != -EWOULDBLOCK))
+			goto exit;
+
+		/* Just entered SS_CONNECTING state; the only
+		 * difference is that return value in non-blocking
+		 * case is EINPROGRESS, rather than EALREADY.
+		 */
+		res = -EINPROGRESS;
+	case SS_CONNECTING:
+		if (previous == SS_CONNECTING)
+			res = -EALREADY;
+		if (!timeout)
+			goto exit;
+		timeout = msecs_to_jiffies(timeout);
+		/* Wait until an 'ACK' or 'RST' arrives, or a timeout occurs */
+		res = tipc_wait_for_connect(sock, &timeout);
+		break;
+	case SS_CONNECTED:
+		res = -EISCONN;
+		break;
+	default:
+		res = -EINVAL;
+		break;
+	}
+exit:
+	release_sock(sk);
+	return res;
+}
+
+If the sock->state is SS_UNCONNECTED, a 'SYN-' will be sent.
+The '-' indicates that the message payload is zero.
+But have no idea about the SYN .
+
+After the 'SYN' is sent successfully, the sock->state will be set to 
+SS_CONNECTING.
+
+__tipc_sendmsg()
+>>>>
+	rc = tipc_link_xmit(net, pktchain, dnode, tsk->portid);
+		if (likely(rc >= 0)) {
+			if (sock->state != SS_READY)
+				sock->state = SS_CONNECTING;
+			rc = dsz;
+			break;
+		}
+
+>>>>
+
+Note, there is no 'break' between case SS_CONNECTING and case SS_UNCONNECTED
+so tipc_connect() start to wait the ACK from the peer.
+static int tipc_wait_for_connect(struct socket *sock, long *timeo_p)
+{
+	struct sock *sk = sock->sk;
+	DEFINE_WAIT(wait);
+	int done;
+
+	do {
+		>>>>>
+		prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+		done = sk_wait_event(sk, timeo_p, sock->state != SS_CONNECTING);
+		finish_wait(sk_sleep(sk), &wait);
+	} while (!done);
+	return 0;
+}
+
+The event for which does tipc_wait_for_connect() wait is sock->state != SS_CONNECTING
+
+
+so far, one node has sent out the connect request, what will the other side do?
+
+The server side need to listen then accept.
+
+tipc_listen() is very easy, just set the sock->state to SS_LISTENING.
+
+filter_rcv() -> filter_connect()
+>>>>
+	case SS_LISTENING:
+	case SS_UNCONNECTED:
+		/* Accept only SYN message */
+		if (!msg_connected(msg) && !(msg_errcode(msg)))
+			retval = TIPC_OK;
+		break;
+
+>>>>
+
+Then the message is queued to the receive_queue of server sock which is waiting
+in tipc_accept()
+
+tipc_accept()
+
+static int tipc_accept(struct socket *sock, struct socket *new_sock, int flags)
+{
+	struct sock *new_sk, *sk = sock->sk;
+	struct sk_buff *buf;
+	struct tipc_sock *new_tsock;
+	struct tipc_msg *msg;
+	long timeo;
+	int res;
+
+	lock_sock(sk);
+
+	if (sock->state != SS_LISTENING) {
+		res = -EINVAL;
+		goto exit;
+	}
+	timeo = sock_rcvtimeo(sk, flags & O_NONBLOCK);
+	res = tipc_wait_for_accept(sock, timeo);
+	if (res)
+		goto exit;
+
+	buf = skb_peek(&sk->sk_receive_queue);
+
+	res = tipc_sk_create(sock_net(sock->sk), new_sock, 0, 1);
+	if (res)
+		goto exit;
+	security_sk_clone(sock->sk, new_sock->sk);
+
+	new_sk = new_sock->sk;
+	new_tsock = tipc_sk(new_sk);
+	msg = buf_msg(buf);
+
+	/* we lock on new_sk; but lockdep sees the lock on sk */
+	lock_sock_nested(new_sk, SINGLE_DEPTH_NESTING);
+
+	/*
+	 * Reject any stray messages received by new socket
+	 * before the socket lock was taken (very, very unlikely)
+	 */
+	tsk_rej_rx_queue(new_sk);
+
+	/* Connect new socket to it's peer */
+	tipc_sk_finish_conn(new_tsock, msg_origport(msg), msg_orignode(msg));
+	new_sock->state = SS_CONNECTED;
+
+	tsk_set_importance(new_tsock, msg_importance(msg));
+	if (msg_named(msg)) {
+		new_tsock->conn_type = msg_nametype(msg);
+		new_tsock->conn_instance = msg_nameinst(msg);
+	}
+
+	/*
+	 * Respond to 'SYN-' by discarding it & returning 'ACK'-.
+	 * Respond to 'SYN+' by queuing it on new socket.
+	 */
+	if (!msg_data_sz(msg)) {
+		struct msghdr m = {NULL,};
+
+		tsk_advance_rx_queue(sk);
+		__tipc_send_stream(new_sock, &m, 0);
+	} else {
+		__skb_dequeue(&sk->sk_receive_queue);
+		__skb_queue_head(&new_sk->sk_receive_queue, buf);
+		skb_set_owner_r(buf, new_sk);
+	}
+	release_sock(new_sk);
+exit:
+	release_sock(sk);
+	return res;
+}
+
+In most case, we should receive a SYN- here, so a ACK- will be sent out.
+
+
+On the client side:
+
+filter_rcv() -> filter_connect()
+>>>>
+	case SS_CONNECTING:
+		/* Accept only ACK or NACK message */
+
+		if (unlikely(!msg_connected(msg)))
+			break;
+		>>>>>
+		tipc_sk_finish_conn(tsk, msg_origport(msg), msg_orignode(msg));
+		msg_set_importance(&tsk->phdr, msg_importance(msg));
+		sock->state = SS_CONNECTED;
+
+		/* If an incoming message is an 'ACK-', it should be
+		 * discarded here because it doesn't contain useful
+		 * data. In addition, we should try to wake up
+		 * connect() routine if sleeping.
+		 */
+		if (msg_data_sz(msg) == 0) {
+			kfree_skb(*skb);
+			*skb = NULL;
+			if (waitqueue_active(sk_sleep(sk)))
+				wake_up_interruptible(sk_sleep(sk));
+		}
+		retval = TIPC_OK;
+		break;
+
+>>>>
+
+
+<I think SYN+ and ACK+ could help to re-establish the connect as quick as 
+possible, which does not need specific SYN and ACK packets >
+
+
+
+After a connection is created, the sock can only receive the packet from 
+the peer of the connection.
+
+tipc_sk_rcv() -> tipc_sk_enqueue() -> filter_rcv() -> filter_connect()
+
+>>>>
+	switch ((int)sock->state) {
+	case SS_CONNECTED:
+		/* Accept only connection-based messages sent by peer */
+		if (tsk_peer_msg(tsk, msg)) {
+			if (unlikely(msg_errcode(msg))) {
+				sock->state = SS_DISCONNECTING;
+				tsk->connected = 0;
+				/* let timer expire on it's own */
+				tipc_node_remove_conn(net, tsk_peer_node(tsk),
+						      tsk->portid);
+			}
+			retval = TIPC_OK;
+		}
+		break;
+	}
+>>>>
+static bool tsk_peer_msg(struct tipc_sock *tsk, struct tipc_msg *msg)
+{
+	struct tipc_net *tn = net_generic(sock_net(&tsk->sk), tipc_net_id);
+	u32 peer_port = tsk_peer_port(tsk);
+	u32 orig_node;
+	u32 peer_node;
+
+	if (unlikely(!tsk->connected))
+		return false;
+
+	if (unlikely(msg_origport(msg) != peer_port))
+		return false;
+
+	orig_node = msg_orignode(msg);
+	peer_node = tsk_peer_node(tsk);
+
+	if (likely(orig_node == peer_node))
+		return true;
+
+	if (!orig_node && (peer_node == tn->own_addr))
+		return true;
+
+	if (!peer_node && (orig_node == tn->own_addr))
+		return true;
+
+	return false;
+}
+
+
+
+When the connection is setup, a timer is armed.
+
+static void tipc_sk_finish_conn(struct tipc_sock *tsk, u32 peer_port,
+				u32 peer_node)
+{
+	struct sock *sk = &tsk->sk;
+	struct net *net = sock_net(sk);
+	struct tipc_msg *msg = &tsk->phdr;
+
+	msg_set_destnode(msg, peer_node);
+	msg_set_destport(msg, peer_port);
+	msg_set_type(msg, TIPC_CONN_MSG);
+	msg_set_lookup_scope(msg, 0);
+	msg_set_hdr_sz(msg, SHORT_H_SIZE);
+
+	tsk->probing_intv = CONN_PROBING_INTERVAL;
+	tsk->probing_state = TIPC_CONN_OK;
+	tsk->connected = 1;
+	sk_reset_timer(sk, &sk->sk_timer, jiffies + tsk->probing_intv);
+	tipc_node_add_conn(net, peer_node, tsk->portid, peer_port);
+	tsk->max_pkt = tipc_node_get_mtu(net, peer_node, tsk->portid);
+}
+
+The expire time is CONN_PROBING_INTERVAL
+#define CONN_PROBING_INTERVAL	msecs_to_jiffies(3600000)  /* [ms] => 1 h */
+
+If the timer expires, what will its timeout callback do?
+
+static void tipc_sk_timeout(unsigned long data)
+{
+	struct tipc_sock *tsk = (struct tipc_sock *)data;
+	struct sock *sk = &tsk->sk;
+	struct sk_buff *skb = NULL;
+	u32 peer_port, peer_node;
+	u32 own_node = tsk_own_node(tsk);
+
+	bh_lock_sock(sk);
+	if (!tsk->connected) {
+		bh_unlock_sock(sk);
+		goto exit;
+	}
+	peer_port = tsk_peer_port(tsk);
+	peer_node = tsk_peer_node(tsk);
+
+	if (tsk->probing_state == TIPC_CONN_PROBING) {
+		if (!sock_owned_by_user(sk)) {
+			sk->sk_socket->state = SS_DISCONNECTING;
+			tsk->connected = 0;
+			tipc_node_remove_conn(sock_net(sk), tsk_peer_node(tsk),
+					      tsk_peer_port(tsk));
+			sk->sk_state_change(sk);
+		} else {
+			/* Try again later */
+			sk_reset_timer(sk, &sk->sk_timer, (HZ / 20));
+		}
+
+	} else {
+		skb = tipc_msg_create(CONN_MANAGER, CONN_PROBE,
+				      INT_H_SIZE, 0, peer_node, own_node,
+				      peer_port, tsk->portid, TIPC_OK);
+		tsk->probing_state = TIPC_CONN_PROBING;
+		sk_reset_timer(sk, &sk->sk_timer, jiffies + tsk->probing_intv);
+	}
+	bh_unlock_sock(sk);
+	if (skb)
+		tipc_link_xmit_skb(sock_net(sk), skb, peer_node, tsk->portid);
+exit:
+	sock_put(sk);
+}
+
+It will send out a message (user:CONN_MANAGER, type:CONN_PROBE, errno:TIPC_OK)
+and the tipc_sock->probing_state become TIPC_CONN_PROBING.
+
+If the timer expires again, and find the probing_state is still
+TIPC_CONN_PROBING, the sock's state will be set to SS_DISCONNECTING.
+
+
+What will the peer of the connection do , after receiving the probe message ?
+
+Note, the message is (user:CONN_MANAGER, type:CONN_PROBE, errno:TIPC_OK)
+filter_rcv()
+>>>>
+	if (unlikely(msg_user(msg) == CONN_MANAGER)) {
+		tipc_sk_proto_rcv(tsk, skb);
+		return TIPC_OK;
+	}
+>>>>
+static void tipc_sk_proto_rcv(struct tipc_sock *tsk, struct sk_buff **skb)
+{
+	struct tipc_msg *msg = buf_msg(*skb);
+	int conn_cong;
+	u32 dnode;
+	u32 own_node = tsk_own_node(tsk);
+	/* Ignore if connection cannot be validated: */
+	if (!tsk_peer_msg(tsk, msg))
+		goto exit;
+
+	tsk->probing_state = TIPC_CONN_OK;
+
+	if (msg_type(msg) == CONN_ACK) {
+		>>>>
+	} else if (msg_type(msg) == CONN_PROBE) {
+		if (tipc_msg_reverse(own_node, *skb, &dnode, TIPC_OK)) {
+			msg_set_type(msg, CONN_PROBE_REPLY);
+			return;
+		}
+	}
+	/* Do nothing if msg_type() == CONN_PROBE_REPLY */
+exit:
+	kfree_skb(*skb);
+	*skb = NULL;
+}
+
+tipc_msg_reverse() swaps source and destination addresses of the tipc_msg.
+<
+tipc_sk_proto_rcv() does not set skb parameter to NULL.
+tipc_sk_rcv() will transmit the skb again.
+The message will be re-transmit to the original sender >
+
+
+
+We have stated that the connection-based tipc have flow-control mechanism, which
+is the biggest advantage over connection-less ones.
+Next, let's see how does the flow-control mechanism work.
+
+First, we know the flow-control mechanism works at send function, let's look at 
+the difference between __tipc_send_stream(connection-based) and 
+__tipc_sendmsg(connection-less).
+
+The key point that indicates the difference is event that they wait for in
+sk_wait_event().
+__tipc_send_stream() -> tipc_wait_for_sndpkt()
+>>>>
+	done = sk_wait_event(sk, timeo_p,
+				     (!tsk->link_cong &&
+				      !tsk_conn_cong(tsk)) ||
+				     !tsk->connected);
+
+>>>>
+__tipc_sendmsg() -> tipc_wait_for_sndmsg
+>>>>
+	done = sk_wait_event(sk, timeo_p, !tsk->link_cong);
+>>>>
+
+Excluding connection state, __tipc_send_stream() will consider the condition of
+tsk_conn_cong(), which __tipc_sendmsg does not.
+
+static int tsk_conn_cong(struct tipc_sock *tsk)
+{
+	return tsk->sent_unacked >= TIPC_FLOWCTRL_WIN;
+}
+
+This is the flow-control threshold.
+
+So let's focus on when does the tipc_sock->sendt_unacked  to be
+increased/decreased.
+
+< Increase >
+__tipc_send_stream()
+>>>>
+	if (likely(!tsk_conn_cong(tsk))) {
+			rc = tipc_link_xmit(net, pktchain, dnode, portid);
+			if (likely(!rc)) {
+				tsk->sent_unacked++;
+				sent += send;
+				if (sent == dsz)
+					break;
+				goto next;
+			}
+			>>>>
+	}
+>>>>
+
+< It seems that the flow-control is not based on the bytes. >
+
+< Decrease >
+
+tipc_sk_proto_rcv()
+>>>>
+	if (msg_type(msg) == CONN_ACK) {
+		conn_cong = tsk_conn_cong(tsk);
+		tsk->sent_unacked -= msg_msgcnt(msg);
+		if (conn_cong)
+			tsk->sk.sk_write_space(&tsk->sk);
+	} 
+>>>>
+The sender receive a message (user:CONN_MANAGER, type:CONN_ACK)
+The sock which has been blocked by flow-control (connection congestion)
+will be waked up by sk_write_space callback.
+
+
+When does the peer of the connection send the CONN_ACK ?
+tipc_recv_stream()
+>>>>
+	/* Consume received message (optional) */
+	if (likely(!(flags & MSG_PEEK))) {
+		if (unlikely(++tsk->rcv_unacked >= TIPC_CONNACK_INTV)) {
+			tipc_sk_send_ack(tsk, tsk->rcv_unacked);
+			tsk->rcv_unacked = 0;
+		}
+		tsk_advance_rx_queue(sk);
+	}
+>>>>
+
+< It seems that the tipc flow-control mechanism is a little crude >
+
+In tipc 2.0 protocol sepecification:
+These assumptions allow TIPC to use a simple, traffic-driven, fixed size sliding 
+window protocol located at the signalling link level, rather than a timer-driven 
+transport level protocol.
+
+There is some other difference that we should pay attention to. 
+These difference also indicate the nature of connection-based and connection-less.
+
+Look at how do these two function deal with tipc_msg * mhdr.
+
+In __tipc_send_stream, it does nothing and use the tipc_sock->phdr directly.
+The destnode, destport and message type has been set into tipc_sock->phdr in 
+tipc_sk_finish_conn().
+
+However, in __tipc_sendmsg, the tipc_msg *mhdr will reset based on the parameter
+struct msghdr->msg_name.
+
+
+----------------------------------------------------------------------------------
+
+In above section, we have discussed the crude flow-control mechanism of TIPC.
+Whether connection-based or connectionless, both have congestion control
+mechanism. Thus, let's look at it this section.
+
+The congestion control mainly happens in tipc link layer.
+There two important queue in tipc_link structure.
+
+transmq  : queue for sent, non-acked messages
+backlogq : queue for messages waiting to be sent
+
+In __tipc_link_xmit()
+>>>>
+	unsigned int maxwin = link->window;
+>>>>
+	uint ack = mod(link->next_in_no - 1);
+	uint seqno = link->next_out_no;
+>>>>
+	skb_queue_walk_safe(list, skb, tmp) {
+		__skb_unlink(skb, list);
+		msg = buf_msg(skb);
+		msg_set_seqno(msg, seqno);
+		msg_set_ack(msg, ack);
+		msg_set_bcast_ack(msg, bc_last_in);
+
+		if (likely(skb_queue_len(transmq) < maxwin)) {
+			__skb_queue_tail(transmq, skb);
+			tipc_bearer_send(net, link->bearer_id, skb, addr);
+			link->rcv_unacked = 0;
+			seqno++;
+			continue;
+		}
+		>>>>
+		__skb_queue_tail(backlogq, skb);
+		link->backlog[imp].len++;
+		seqno++;
+	}
+>>>>
+
+when the number of sent-not-acked packet has reached the tipc_link->window,
+the skb will be queued to tipc_link->backlogq[msg_importance()], otherwise, 
+the skb will be sent by bearer and queued on tipc_link->transmq.
+
+
+The length of tipc_link->transmq indicates the number of sent-not-acked packets.
+When does it decrease?
+
+In tipc_rcv()
+	>>>>
+		ackd = msg_ack(msg);
+		>>>>
+		skb_queue_walk_safe(&l_ptr->transmq, skb1, tmp) {
+			if (more(buf_seqno(skb1), ackd))
+				break;
+			 __skb_unlink(skb1, &l_ptr->transmq);
+			 kfree_skb(skb1);
+			 released = 1;
+		}
+	>>>>
+
+What is the size of the congestion window of tipc?
+
+The tipc_link->window could be set by tipc_link_set_queue_limits()
+
+void tipc_link_set_queue_limits(struct tipc_link *l, u32 win)
+{
+	int max_bulk = TIPC_MAX_PUBLICATIONS / (l->mtu / ITEM_SIZE);
+
+	l->window = win;
+	l->backlog[TIPC_LOW_IMPORTANCE].limit      = win / 2;
+	l->backlog[TIPC_MEDIUM_IMPORTANCE].limit   = win;
+	l->backlog[TIPC_HIGH_IMPORTANCE].limit     = win / 2 * 3;
+	l->backlog[TIPC_CRITICAL_IMPORTANCE].limit = win * 2;
+	l->backlog[TIPC_SYSTEM_IMPORTANCE].limit   = max_bulk;
+}
+
+tipc_link_create() and tipc_nl_link_set() will invoke it.
+By default, the tipc_link->window inherits from the tipc_bear->window,
+and tipc_bear->window inherits from tipc_media->window.
+For ethernet media, the window size is TIPC_DEF_LINK_WIN (50).
+
+If the sent-not-acked packets reaches the window, the skb will be queued 
+on backlog queue.
+
+When will be the packets on backlog queue sent again?
+tipc_rcv()
+>>>>
+	/* Try sending any messages link endpoint has pending */
+	if (unlikely(skb_queue_len(&l_ptr->backlogq)))
+		tipc_link_push_packets(l_ptr);
+>>>>
+void tipc_link_push_packets(struct tipc_link *link)
+{
+	struct sk_buff *skb;
+	struct tipc_msg *msg;
+	unsigned int ack = mod(link->next_in_no - 1);
+
+	while (skb_queue_len(&link->transmq) < link->window) {
+		skb = __skb_dequeue(&link->backlogq);
+		if (!skb)
+			break;
+		msg = buf_msg(skb);
+		link->backlog[msg_importance(msg)].len--;
+		msg_set_ack(msg, ack);
+		msg_set_bcast_ack(msg, link->owner->bclink.last_in);
+		link->rcv_unacked = 0;
+		__skb_queue_tail(&link->transmq, skb);
+		tipc_bearer_send(link->owner->net, link->bearer_id,
+				 skb, &link->media_addr);
+	}
+}
+
+< The link_timeout will also invoke tipc_link_push_packets() >
+
+
+tipc_rcv() will adjust the tipc_link->transmq based on the ack number of the 
+receiving packets, thus, it is a chance to sent the packets queued in
+tipc_link->backlogq.
+
+
+However, the length of the tipc_link->backlogq is not unlimited, if its length 
+reaches the limit, the queue operation would be forbidden.
+
+__tipc_link_xmit()
+>>>>
+ 	/* Match backlog limit against msg importance: */
+	if (unlikely(link->backlog[imp].len >= link->backlog[imp].limit))
+		return link_schedule_user(link, list);
+>>>>
+
+static int link_schedule_user(struct tipc_link *link, struct sk_buff_head *list)
+{
+	struct tipc_msg *msg = buf_msg(skb_peek(list));
+	int imp = msg_importance(msg);
+	u32 oport = msg_origport(msg);
+	u32 addr = link_own_addr(link);
+	struct sk_buff *skb;
+
+	/* This really cannot happen...  */
+	if (unlikely(imp > TIPC_CRITICAL_IMPORTANCE)) {
+		pr_warn("%s<%s>, send queue full", link_rst_msg, link->name);
+		tipc_link_reset(link);
+		goto err;
+	}
+	/* Non-blocking sender: */
+	if (TIPC_SKB_CB(skb_peek(list))->wakeup_pending)
+		return -ELINKCONG;
+
+	/* Create and schedule wakeup pseudo message */
+	skb = tipc_msg_create(SOCK_WAKEUP, 0, INT_H_SIZE, 0,
+			      addr, addr, oport, 0, 0);
+	if (!skb)
+		goto err;
+	TIPC_SKB_CB(skb)->chain_sz = skb_queue_len(list);
+	TIPC_SKB_CB(skb)->chain_imp = imp;
+	skb_queue_tail(&link->wakeupq, skb);
+	link->stats.link_congs++;
+	return -ELINKCONG;
+err:
+	__skb_queue_purge(list);
+	return -ENOBUFS;
+}
+
+A pseudo message is built here. Its port and addr all points to itself.
+This pseudo message is queued on tipc_link->wakeupq.
+
+The tipc_link->wakeupq is handled in tipc_rcv()
+>>>>
+		if (released && !skb_queue_empty(&l_ptr->wakeupq))
+			link_prepare_wakeup(l_ptr);
+>>>>
+
+The release is set when there are packets in tipc_link->transmq to be 
+released in tipc_rcv() based the ack seq of the receiving message and congestion
+window maybe open now.
+
+void link_prepare_wakeup(struct tipc_link *l)
+{
+	int pnd[TIPC_SYSTEM_IMPORTANCE + 1] = {0,};
+	int imp, lim;
+	struct sk_buff *skb, *tmp;
+
+	skb_queue_walk_safe(&l->wakeupq, skb, tmp) {
+		imp = TIPC_SKB_CB(skb)->chain_imp;
+		lim = l->window + l->backlog[imp].limit;
+		pnd[imp] += TIPC_SKB_CB(skb)->chain_sz;
+		if ((pnd[imp] + l->backlog[imp].len) >= lim)
+			break;
+		skb_unlink(skb, &l->wakeupq);
+		skb_queue_tail(&l->inputq, skb);
+		l->owner->inputq = &l->inputq;
+		l->owner->action_flags |= TIPC_MSG_EVT;
+	}
+}
+
+tipc_node_unlock() -> tipc_sk_rcv() -> tipc_sk_enqueue() -> filter_rcv()
+>>>>
+	if (unlikely(msg_user(msg) == SOCK_WAKEUP)) {
+		kfree_skb(*skb);
+		tsk->link_cong = 0;
+		sk->sk_write_space(sk);
+		*skb = NULL;
+		return TIPC_OK;
+	}
+>>>>
+
+The sk_write_space callback will wakeup the sleeper in __tipc_sendmsg() or 
+__tipc_send_stream.
+
+The limits of the backlog queue is different based on the importance of the 
+message.
+
+we could know the importance of one message through msg_importance()
+
+static inline u32 msg_importance(struct tipc_msg *m)
+{
+	if (unlikely(msg_user(m) == MSG_FRAGMENTER))
+		return msg_bits(m, 9, 0, 0x7);
+	if (likely(msg_isdata(m) && !msg_errcode(m)))
+		return msg_user(m);
+	return TIPC_SYSTEM_IMPORTANCE;
+}
+
+void tipc_link_set_queue_limits(struct tipc_link *l, u32 win)
+{
+	int max_bulk = TIPC_MAX_PUBLICATIONS / (l->mtu / ITEM_SIZE);
+
+	l->window = win;
+	l->backlog[TIPC_LOW_IMPORTANCE].limit      = win / 2;
+	l->backlog[TIPC_MEDIUM_IMPORTANCE].limit   = win;
+	l->backlog[TIPC_HIGH_IMPORTANCE].limit     = win / 2 * 3;
+	l->backlog[TIPC_CRITICAL_IMPORTANCE].limit = win * 2;
+	l->backlog[TIPC_SYSTEM_IMPORTANCE].limit   = max_bulk;
+}
+
+A commit 1f66d161ab3d8b518903fa6c3f9c1f48d6919e74 introduce the 
+mechanism that every importance priority have its own backlogq length 
+instead of a single length. This could eliminate the risk that the high 
+priority message starves the low priority message.
+
+
+
+----------------------------------------------------------------------------
+
+Does tipc node have forwarding function ?
+
+According to tipc_sk_rcv(), the answer seems to be 'yes' .
+
+int tipc_sk_rcv(struct net *net, struct sk_buff_head *inputq)
+{
+	u32 dnode, dport = 0;
+	int err;
+	struct sk_buff *skb;
+	struct tipc_sock *tsk;
+	struct tipc_net *tn;
+	struct sock *sk;
+
+	while (skb_queue_len(inputq)) {
+		err = -TIPC_ERR_NO_PORT;
+		skb = NULL;
+		dport = tipc_skb_peek_port(inputq, dport);
+		tsk = tipc_sk_lookup(net, dport);
+		if (likely(tsk)) {
+			sk = &tsk->sk;
+			if (likely(spin_trylock_bh(&sk->sk_lock.slock))) {
+				err = tipc_sk_enqueue(inputq, sk, dport, &skb);
+				spin_unlock_bh(&sk->sk_lock.slock);
+				dport = 0;
+			}
+			sock_put(sk);
+		} else {
+			skb = tipc_skb_dequeue(inputq, dport);
+		}
+		if (likely(!skb))
+			continue;
+		if (tipc_msg_lookup_dest(net, skb, &dnode, &err))
+			goto xmit;
+		if (!err) {
+			dnode = msg_destnode(buf_msg(skb));
+			goto xmit;
+		}
+		tn = net_generic(net, tipc_net_id);
+		if (!tipc_msg_reverse(tn->own_addr, skb, &dnode, -err))
+			continue;
+xmit:
+		tipc_link_xmit_skb(net, skb, dnode, dport);
+	}
+	return err ? -EHOSTUNREACH : 0;
+}
+
+The skb is re-transmit to the destination node which is re-lookup here.
+
+From the tipc 2.0 protocol specification:
+If the sender node is outside the lookup domain, the message is forwarded to a node 
+within that domain for further lookup. On the receiving node the lookup procedure 
+just described in the previous steps are performed.
+
+How to send message to the node that locates in different domain ?
+
+tipc_link_xmit() -> tipc_node_find()
+
+>>>>
+if (unlikely(!in_own_cluster_exact(net, addr)))
+		return NULL;
+>>>>
+
+It is deemed that the message can only be sent to nodes in same cluster.
+
+----------------------------------------------------------------------------------
+More details about tipc link
+
+The FSM (Finite State Machine) of tipc link.
+
+We have known that a tipc link will be created after receiving discovery
+response which carries the peer node's node address and media address( For ethernet,
+it is MAC).
+The souce code path is tipc_disc_rcv() -> tipc_link_create().
+And the link state is set to RESET_UNKNOWN which means local endpoint of link is
+set back to initial value but the peer endpoint is unkown.
+
+The entry of tipc link FSM is link_state_event(). According to this function, we
+could read the life of a link.
+
+The tipc link FSM is driven by traffic and timer.
+A specific message user and 3 sub-message=type.
+LINK_PROTOCOL
+STATE_MSG     Detailed state of a working link endpoint 
+RESET_MSG     Reset receiving endpoint.
+ACTIVATE_MSG  Sender in RESET_RESET,ready to receive
+
+These messages are handled by tipc_link_proto_rcv()
+
+-----------------------
+
+A timer is setup when the link is created. The handler is link_timeout().
+The most important question about this timer is when does it expire ?
+
+The link timer is armed when it is created.
+The expire time is set in tipc_link_create() -> link_set_supervision_props();
+For ethernet media, the default interval is 375ms
+
+< This timer is resident >
+In link_timeout(), some statistics work is done, try to transmit the packets on
+backlog queue, and most important one, it will invoke link_state_event().
+
+Let's look at what will link_state_event() do if the link is in WORKING_WORKING
+state.
+>>>>>
+		case TIMEOUT_EVT:
+			if (l_ptr->next_in_no != l_ptr->checkpoint) {
+				l_ptr->checkpoint = l_ptr->next_in_no;
+				if (tipc_bclink_acks_missing(l_ptr->owner)) {
+					tipc_link_proto_xmit(l_ptr, STATE_MSG,
+							     0, 0, 0, 0);
+					l_ptr->fsm_msg_cnt++;
+				}
+				link_set_timer(l_ptr, cont_intv);
+				break;
+			}
+			l_ptr->state = WORKING_UNKNOWN;
+			l_ptr->fsm_msg_cnt = 0;
+			tipc_link_proto_xmit(l_ptr, STATE_MSG, 1, 0, 0, 0);
+			l_ptr->fsm_msg_cnt++;
+			link_set_timer(l_ptr, cont_intv / 4);
+			break;
+>>>>
+The comment for checkpoint of tipc_link:
+checkpoint: reference point for triggering link continuity checking
+
+When this link is in WORKING_WORKING state, if there is no message in between
+this interval ( next_in_no == checkpoint), it indicates that there has been no 
+traffic on this link for some time and we should do some check next.
+
+Set the link state to WORKING_UNKNOW , send a STATE_MSG message with probe bit
+and re-arm the timer with interval/4 .
+
+After the STATE_MSG is sent, what will happen?
+
+< If the peer does not reply >
+
+The link timer will expire and invoke link_state_event()
+
+>>>> WORKING_UNKNOWN state
+	case TIMEOUT_EVT:
+			if (l_ptr->next_in_no != l_ptr->checkpoint) {
+			>>>>
+			} else if (l_ptr->fsm_msg_cnt < l_ptr->abort_limit) {
+				tipc_link_proto_xmit(l_ptr, STATE_MSG,
+						     1, 0, 0, 0);
+				l_ptr->fsm_msg_cnt++;
+				link_set_timer(l_ptr, cont_intv / 4);
+			} else {	/* Link has failed */
+				pr_debug("%s<%s>, peer not responding\n",
+					 link_rst_msg, l_ptr->name);
+				tipc_link_reset(l_ptr);
+				l_ptr->state = RESET_UNKNOWN;
+				l_ptr->fsm_msg_cnt = 0;
+				tipc_link_proto_xmit(l_ptr, RESET_MSG,
+						     0, 0, 0, 0);
+				l_ptr->fsm_msg_cnt++;
+				link_set_timer(l_ptr, cont_intv);
+			}
+			break;
+>>>>
+
+This is another threshold to judge failure of the link: tipc_link->abort_limit.
+It is set in link_set_supervision_props(). It will try to send SATE_MSG to peer
+until the number of re-try times reaches tipc_link->abort_limit. If the peer
+never reply, the link will be reset and state will be set to RESET_UNKNOWN.
+
+
+< If the peer reply >
+
+In tipc 2.0 protocol specification, it explain the probe bit as follow:
+Probe: 1 bit. Used by: LINK_PROTOCOL. This one-bit field is used only by messages 
+of type LINK_PROTOCOL/ STATE_MSG. When set it instructs the receiving link endpoint
+to immediately respond with a STATE_MSG. The Probe bit MUST NOT be set in the 
+responding message.
+
+A important sepecifics of this link protocol message is the seqno:
+In tipc_link_proto_xmit():
+>>>>
+msg_set_seqno(msg, mod(l_ptr->next_out_no + (0xffff/2)));
+>>>>
+
+Obseriously, it is a out-of-order message for the peer.
+Thus, in common case, the tipc_link_proto_rcv() will be invoked by
+link_handle_out_of_seq_msg().
+The LINK_PROTOCOL/STATE_MSG is handled as a TRAFFIC_MSG_EVT and a STATE_MSG
+without probe bit will be sent back.
+
+The sender link which has been set to WORKING_UNKNOWN receives the message and
+tipc_rcv() will invoke tipc_link_proto_rcv(), a TRAFFIC_MSG_EVT will be
+transfered to tipc link FSM:
+>>>>
+	case TRAFFIC_MSG_EVT:
+		case ACTIVATE_MSG:
+			l_ptr->state = WORKING_WORKING;
+			l_ptr->fsm_msg_cnt = 0;
+			link_set_timer(l_ptr, cont_intv);
+			break;
+>>>>
+The link convert to WORKING_WORKING again.
+
+------------------------
+
+How is the link activated?
+
+RESET_UNKNOWN receiving ACTIVATE_MSG
+RESET_RESET   receiving ACTIVATE_MSG TRAFFIC_MSG_EVT (It could be generated by a
+		                STATE_MSG)
+
+How is the link set to RESET state ?
+There are two RESET state, RESET_UNKNOWN and RESET_RESET
+The default state of the link when it is create in tipc_link_create() is
+RESET_UNKNOWN, Or invoke tipc_link_reset() to reset endpoint.
+
+The only way to be RESET_RESET is receiving a LINK_PROTOCOL/RESET_MSG from the peer.
+
+Because the queues are emptied and sequence numbers are set back to their
+initial values after link endpoint reset, so the peer endpoint must also reset.
+
+When to send ACTIVATE_MSG ?
+
+After receiving LINK_PROTOCOL/RESET_MSG.
+If one endpoint of the link receive RESET_MSG, it will reset the link and
+transmit ACTIVATE_MSG to peer endpoint periodicly. 
+
+
+Who send the first RESET_MSG ?
+
+When the link is created, the STARTING_EVT will be delivered to
+link_state_event().
+>>>>
+		case STARTING_EVT:
+			l_ptr->flags |= LINK_STARTED;
+			l_ptr->fsm_msg_cnt++;
+			link_set_timer(l_ptr, cont_intv);
+			break;
+		case TIMEOUT_EVT:
+			tipc_link_proto_xmit(l_ptr, RESET_MSG, 0, 0, 0, 0);
+			l_ptr->fsm_msg_cnt++;
+			link_set_timer(l_ptr, cont_intv);
+			break;
+>>>>
+And then it will start to send RESET_MSG periodicly.
+
+<There seems a defect in current version source code, the first RESET_MSG will
+be sent after the first TIMEOUT_EVT. The activating of the link is delayed. Why not send
+a RESET_MSG after STARTING_EVT >
+
+----------------------
+
+Load sharing and standby link 
+
+There could be concurrently MAX_BEARERS(2) links to a same node. They are saved
+in tipc_node->links[]. (tipc_link_create() -> tipc_node_attach_link() )
+
+There could be 2 working links to a same node. They are saved in
+tipc_node->active_links[]. (tipc_node_link_up()) These two different links must
+have same priority.
+
+What is the load sharing?
+If two active link have same priority, they will be save in
+tipc_node->active_links[], and sharing the payload traffic to the peer node.
+In the tipc 2.0 protocol specification, it explain load sharing as following:
+
+Load Sharing is used when the links have the same priority value. Payload traffic 
+is shared equally over the two links, in order to take full advantage of available
+bandwidth. The selection of which link to use must be done in a deterministic way,
+so that message sequentiality can be preserved for each individual sender port. To
+obtain this a Link Selector is used. This must be value correlated to the sender 
+in such a way that all messages from that sender choose the same link, while 
+guaranteeing a statistically equal possibility for both links to be selected for 
+the overall traffic between the nodes. A simple example of a link selector with 
+the right properties is the last two bits of the random number part of the 
+originating port's identity, another is the same bits in Fragmented Message Number 
+in message fragments.
+
+The tipc_link_xmit()'s 4th parameter is the selector.
+int tipc_link_xmit(struct net *net, struct sk_buff_head *list, u32 dnode,
+		   u32 selector)
+{
+	struct tipc_link *link = NULL;
+	struct tipc_node *node;
+	int rc = -EHOSTUNREACH;
+
+	node = tipc_node_find(net, dnode);
+	if (node) {
+		tipc_node_lock(node);
+		link = node->active_links[selector & 1];
+		if (link)
+			rc = __tipc_link_xmit(net, link, list);
+		tipc_node_unlock(node);
+		tipc_node_put(node);
+	}
+	>>>>>
+}
+
+The caller of tipc_link_xmit() usually use tipc_sock->portid as the selector.
+
+There is a doubt here:
+For example, before the new link to node I is setup, some messages from port A
+and port B have been sent to node I, but not acked.
+link O  backlogq -> Ma0 -> Ma1 -> Mb0 -> Mb1
+
+Then the new link which have same priority with the older one is setup.
+From then on, the traffic from port b will be sent by link N.
+link O  backlogq -> Ma0 -> Ma1 -> Mb0 -> Mb1
+link N  transmq -> Mb2 -> Mb3
+
+The questions come, due to the congestion of link O, the Mb2 and Mb3 are
+delivered before the Mb0 and Mb1.
+
+How to guarantee the sequence order here ?
+
+tipc_node_link_up()
+>>>>
+	if (l_ptr->priority < active[0]->priority) {
+		pr_debug("New link <%s> becomes standby\n", l_ptr->name);
+		goto exit;
+	}
+	tipc_link_dup_queue_xmit(active[0], l_ptr);
+	if (l_ptr->priority == active[0]->priority) {
+		active[0] = l_ptr;
+		goto exit;
+	}
+
+>>>>
+
+tipc_link_dup_queue_xmit() wraps the messages in original link's transmq and
+backlogq into TUNNEL_PROTOCOL/SYNCH_MSG and sends through the new link.
+
+tipc_link_input()
+>>>>
+	case TUNNEL_PROTOCOL:
+		if (msg_dup(msg)) {
+			link->flags |= LINK_SYNCHING;
+			link->synch_point = msg_seqno(msg_get_wrapped(msg));
+			/* The messages in original transmq and backlogq are in order, thus,
+			 * we can directly use the seqno from the wrapped message */
+			kfree_skb(skb);
+			break;
+		}
+>>>>
+The TUNNEL_PROTOCOL/SYNCH_MSG messages flag the peer link LINK_SYNCHING and
+update the synch_point.
+
+The messages that has been in original link's queues (transmq or backlogq) will
+be still transmitted by the original link. Any packets arrived in peer before
+the two parallel links synchronize, will be dropped.
+
+tipc_rcv()
+>>>>
+	/* Synchronize with parallel link if applicable */
+		if (unlikely((l_ptr->flags & LINK_SYNCHING) && !msg_dup(msg))) {
+			if (!link_synch(l_ptr))
+				goto unlock;
+		}
+>>>>
+
+How to judge the two parallel links has synchronized?
+
+static bool link_synch(struct tipc_link *l)
+{
+	unsigned int post_synch;
+	struct tipc_link *pl;
+
+	pl  = tipc_parallel_link(l);
+	if (pl == l)
+		goto synched;
+
+	/* Was last pre-synch packet added to input queue ? */
+	if (less_eq(pl->next_in_no, l->synch_point))
+		return false;
+
+	/* Is it still in the input queue ? */
+	post_synch = mod(pl->next_in_no - l->synch_point) - 1;
+	if (skb_queue_len(&pl->inputq) > post_synch)
+		return false;
+synched:
+	l->flags &= ~LINK_SYNCHING;
+	return true;
+}
+
+The messages in original links which should be sent through new links, has
+arrived in peer and been consumed.
+
+< There seem to be some redundant code here. In tipc_link_dup_queue_xmit(), all
+the messages in transmq and backlogq are wrapped into TUNNEL_PROTOCOL/SYNCH_MSG.
+However, in tipc_link_input(), we only use the seqno of the wrapped message,
+then free the skb. It seems too inefficient. In fact , we just need tell the
+peer link the synch_point. >
+
+
+---------------------------------
+What is the standby link?
+
+If a new link's priority is lower than the current link to a same node, this new
+link will become a standby one. It will be saved in tipc_node->links[].
+In tipc 2.0 protocol specification, it descripts it as following:
+
+When the priority of one link has a higher numeral value than that of the others, 
+all traffic will go through that link, denoted the Active Link. The other links 
+will be kept up and working with the help of the continuity timer and probe 
+messages, and are called Standby Links. The task of these link is to take over 
+traffic in case the active link fails.
+
+Through tipc_link_xmit(), we could know the payload traffic will be transmitted
+by the links that saved in tipc_node->active_links[]; The standby one which is
+saved in tipc_node->links[], will rely on the continuity timer( link timer) and
+probe messages for live, due to no traffic passing on it.
+
+We have know that, the standby link's task is to take over the traffic in case
+the active links fails. Thus, let's see how is the 'take over' implemented.
+< Note: the link that take over the failure one could be whether the standby one
+or the another active one >
+
+To implement this 'take over', we must guarantee the the following points:
+a. the packets in failure links's transmq and backlogq must be retransmitted.
+b. the sequence order of the 'take over' link
+
+The comment of tipc_link_failover_send_queue() gives us a very good description:
+< A link has gone down, but a second link is still active. We can do failover. 
+Tunnel the failing link's whole send queue via the remaining link. This way, we 
+don't lose any packets, and sequence order is preserved for subsequent traffic
+sent over the remaining link. >
+
+When to do the link failover?
+When a link to one node is down and there is still another link to node.
+tipc_node_link_down()
+>>>>
+	active = &n_ptr->active_links[0];
+	if (active[0] == l_ptr)
+		active[0] = active[1];
+	if (active[1] == l_ptr)
+		active[1] = active[0];
+	if (active[0] == l_ptr)
+		node_select_active_links(n_ptr);
+	if (tipc_node_is_up(n_ptr))
+		tipc_link_failover_send_queue(l_ptr);
+	else
+		node_lost_contact(n_ptr);
+>>>>
+we could choose another active link or use node_select_active_links() to select 
+a higher priority and WORKING state standby link and use it as a new active link.
+
+If any other link could be used, node_lost_contact() will be invoked . This function 
+will create a pseudo message to notify the sockets (connection-based) connected to this 
+node.
+node_lost_contact()
+>>>>
+	* Notify sockets connected to node */
+	list_for_each_entry_safe(conn, safe, conns, list) {
+		skb = tipc_msg_create(TIPC_CRITICAL_IMPORTANCE, TIPC_CONN_MSG,
+				      SHORT_H_SIZE, 0, tn->own_addr,
+				      conn->peer_node, conn->port,
+				      conn->peer_port, TIPC_ERR_NO_NODE);
+		if (likely(skb)) {
+			skb_queue_tail(n_ptr->inputq, skb);
+			n_ptr->action_flags |= TIPC_MSG_EVT;
+		}
+		list_del(&conn->list);
+		kfree(conn);
+	}
+
+>>>>
+
+filter_connect()
+>>>>
+	case SS_CONNECTED:
+		/* Accept only connection-based messages sent by peer */
+		if (tsk_peer_msg(tsk, msg)) {
+			if (unlikely(msg_errcode(msg))) {
+				sock->state = SS_DISCONNECTING;
+				tsk->connected = 0;
+				/* let timer expire on it's own */
+				tipc_node_remove_conn(net, tsk_peer_node(tsk),
+						      tsk->portid);
+			}
+			retval = TIPC_OK;
+		}
+		break;
+>>>>
+
+
+Ok, let's return to failurel link take over.
+
+If there is still any active link to the node,  whether the standby one or the
+loadsharing one(same priority), tipc_node_link_down() will invoke
+tipc_link_failover_send_queue().
+
+The tipc_node_link_down() is only invoked by tipc_link_reset().
+< we should consider the all the cases that we need to reset the link. Which is
+the sigle-side operation and which is the both-side. >
+
+tipc_link_failover_send_queue()
+>>>>
+	tipc_msg_init(link_own_addr(l_ptr), &tunnel_hdr, TUNNEL_PROTOCOL,
+		      FAILOVER_MSG, INT_H_SIZE, l_ptr->addr);
+	skb_queue_splice_tail_init(&l_ptr->backlogq, &l_ptr->transmq);
+	tipc_link_purge_backlog(l_ptr);
+	msgcount = skb_queue_len(&l_ptr->transmq);
+	msg_set_bearer_id(&tunnel_hdr, l_ptr->peer_bearer_id);
+	msg_set_msgcnt(&tunnel_hdr, msgcount);
+>>>>
+skb_queue_walk(&l_ptr->transmq, skb) {
+		struct tipc_msg *msg = buf_msg(skb);
+
+		if ((msg_user(msg) == MSG_BUNDLER) && split_bundles) {
+		>>>> ignore the message bundle temporarily
+		} else {
+			tipc_link_tunnel_xmit(l_ptr, &tunnel_hdr, msg,
+					      msg_link_selector(msg));
+		}
+	}
+
+>>>>
+Points that need to emphasized:
+a. TUNNEL_PROTOCOL/FAILOVER_MSG
+b. skb_queue_splice_tail_init(&l_ptr->backlogq, &l_ptr->transmq);
+c. bearer_id of the TUNNEL_PROTOCOL/FAILOVER_MSG message should be the original
+   link's bearer
+
+The receiver side:
+
+tipc_link_input() -> tipc_link_failover_rcv()
+>>>>
+	int bearer_id = msg_bearer_id(msg);
+>>>>
+	pl = link->owner->links[bearer_id];
+	if (pl && tipc_link_is_up(pl))
+		tipc_link_reset(pl);
+
+	if (link->failover_pkts == FIRST_FAILOVER)
+		link->failover_pkts = msg_msgcnt(msg);
+
+	/* Should we expect an inner packet? */
+	if (!link->failover_pkts)
+		goto exit;
+
+	/* extract the wrapped message in the tunnel message */
+	if (!tipc_msg_extract(*skb, &iskb, &pos)) {
+		pr_warn("%sno inner failover pkt\n", link_co_err);
+		*skb = NULL;
+		goto exit;
+	}
+	link->failover_pkts--;
+	*skb = NULL;
+
+	/* Was this packet already delivered? */
+	if (less(buf_seqno(iskb), link->failover_checkpt)) {
+		kfree_skb(iskb);
+		iskb = NULL;
+		goto exit;
+	}
+>>>>
+	kfree_skb(*skb);
+	*skb = iskb;
+	return *skb;
+
+>>>>
+
+Where does the tipc set the tipc_link->failover_checkpt ?
+
+tipc_link_reset()
+>>>>
+	tipc_node_link_down(l_ptr->owner, l_ptr);
+>>>>
+	if (was_active_link && tipc_node_is_up(l_ptr->owner) && (pl != l_ptr)) {
+		l_ptr->flags |= LINK_FAILINGOVER;
+		l_ptr->failover_checkpt = l_ptr->next_in_no;
+		pl->failover_pkts = FIRST_FAILOVER;
+		pl->failover_checkpt = l_ptr->next_in_no;
+		pl->failover_skb = l_ptr->reasm_buf;
+	} else {
+		kfree_skb(l_ptr->reasm_buf);
+	}
+>>>>
+
+< pl->failover_checkpt = l_ptr->next_in_no >
+Any message that has a lower seqno than failover_checkpt is deemed to be
+duplicate one.
+
+Then the inner message that wapped in TUNNEL_PROTOCOL/FAILOVER_MSG will be
+delivered to tipc_data_input() 
+tipc_link_input()
+>>>>
+	case TUNNEL_PROTOCOL:
+		if (msg_dup(msg)) {
+			link->flags |= LINK_SYNCHING;
+			link->synch_point = msg_seqno(msg_get_wrapped(msg));
+			kfree_skb(skb);
+			break;
+		}
+		if (!tipc_link_failover_rcv(link, &skb))
+			break;
+		if (msg_user(buf_msg(skb)) != MSG_BUNDLER) {
+			tipc_data_input(link, skb);
+			break;
+		}
+	case MSG_BUNDLER:
+		link->stats.recv_bundles++;
+		link->stats.recv_bundled += msg_msgcnt(msg);
+
+		while (tipc_msg_extract(skb, &iskb, &pos))
+			tipc_data_input(link, iskb);
+		break;
+>>>>
+
+Why not deliver to tipc_rcv() or tipc_link_input() ?
+The link that handles the failover message has been reset at this moment.
+Thus we should pass through the link layer, and actually, only the normal
+payload could be handled now.
+
+
+
+----------------------------------
+TIPC Retransmission
+
+We have talked a lot about tipc, however, we seem to have not mentioned anything about
+the retransmission mechanism.
+
+The retransmission of tipc relies on the sequence control in link layer. In tipc
+2.0 protocol specification 7.2.4 secion, the mechanism is descripted in details.
+
+Each packet eligible to be sent on a link is assigned a Link Level Sequence Number, and
+appended to a send queue associated with the link endpoint. The link layer will
+guarantee the sequentiality.
+
+If the packet's sequence number is equal to Last Received Sequence Number + 1 
+(mod 2^16-1), the counter is updated, and the packet is delivered upwards in the stack.
+
+If the sequence number is lower, the packet is considered  a duplicate, and is silently 
+discarded.
+
+If a gap is found in the sequence, the packet is sorted into the Deferred Incoming 
+Packets Queue associated to the link endpoint, to be re-sequenced and delivered upwards 
+when the missing packets arrive.
+
+A LINK_PROTOCOL/STATE_MSG message carrying the sequence gap will be sent to the
+sender to inform it to retransmit the missing packets immediately.
+
+link_handle_out_of_seq_msg()
+>>>>
+/*
+	 * Discard packet if a duplicate; otherwise add it to deferred queue
+	 * and notify peer of gap as per protocol specification
+	 */
+	if (less(seq_no, mod(l_ptr->next_in_no))) {
+		l_ptr->stats.duplicates++;
+		kfree_skb(buf);
+		return;
+	}
+
+	if (tipc_link_defer_pkt(&l_ptr->deferdq, buf)) {
+		l_ptr->stats.deferred_recv++;
+		if ((skb_queue_len(&l_ptr->deferdq) % TIPC_MIN_LINK_WIN) == 1)
+			tipc_link_proto_xmit(l_ptr, STATE_MSG, 0, 0, 0, 0);
+	} 
+>>>>
+
+tipc_link_proto_xmit()
+>>>>
+	if (msg_typ == STATE_MSG) {
+		u32 next_sent = mod(l_ptr->next_out_no);
+
+		if (!tipc_link_is_up(l_ptr))
+			return;
+		if (skb_queue_len(&l_ptr->backlogq))
+			next_sent = buf_seqno(skb_peek(&l_ptr->backlogq));
+		msg_set_next_sent(msg, next_sent);
+		if (!skb_queue_empty(&l_ptr->deferdq)) {
+			u32 rec = buf_seqno(skb_peek(&l_ptr->deferdq));
+			gap = mod(rec - mod(l_ptr->next_in_no));
+		}
+		msg_set_seq_gap(msg, gap);
+		if (gap)
+			l_ptr->stats.sent_nacks++;
+		msg_set_link_tolerance(msg, tolerance);
+		msg_set_linkprio(msg, priority);
+		msg_set_max_pkt(msg, l_ptr->mtu);
+		msg_set_ack(msg, mod(l_ptr->next_in_no - 1));
+		msg_set_probe(msg, probe_msg != 0);
+		if (probe_msg)
+			l_ptr->stats.sent_probes++;
+		l_ptr->stats.sent_states++;
+	}
+>>>>
+
+How to handle the LINK_PROTOCOL/STATE_MSG that carries sequence gap?
+
+tipc_link_proto_rcv()
+>>>>
+		if (msg_seq_gap(msg)) {
+			l_ptr->stats.recv_nacks++;
+			tipc_link_retransmit(l_ptr, skb_peek(&l_ptr->transmq),
+					     msg_seq_gap(msg));
+		}
+>>>>
+
+tipc_link_retransmit() will retransmit the top (gap) packets in tipc_link->transmq.
+
+----------------------------------
+
+Message Bundling
+
+Please refer to 7.2.6 section to get more details about it.
+
+We could use message bundling to avoid some congestion situation is due to tipc
+congestion control is based on packet sequence number instead of packet bytes.
+
+It seems to be a small tip based on the rough congestion control mechanism of tipc.
+
+__tipc_link_xmit() tipc_link_input()
+
+
+--------------------------------------
+
+-------------------------------------------------------------------------
+
+Tipc have multicast function.
+
+If the sender of a message indicates a port name sequence instead of a port name, 
+a replica of the message will be sent to all ports bound to a name sequence fully 
+or partially overlapping with the sequence indicated.
+
+                                        +----> bind(type:17, lower:10,upper:19)
+                                        |
+send (type:17, lower:7, upper:13) -->---+
+                                        |
+										+----> bind (type:17, lower:0, upper:9)
+
+According to tipc 2.0 protocol specification 5.1.4:
+The following procedure applies for finding the correct destinations:
+
+1. Initially, the Destination Port and Destination Node fields of
+the message header are empty.
+2. A first lookup is performed, unconditionally, on the sending
+node. Here, all node local matching destination ports are
+identified, and a copy of the message is sent to each and one of
+them.
+3. At the same time, the lookup identifies if there are any
+publications from external, cluster local, nodes. If so, a copy
+of the message is sent via the broadcast link to all nodes in the
+cluster.
+4. At each destination node, a final lookup is made, once again to
+identify node local destination ports. A copy of the message is
+sent each and one of them.
+5. If any of the found destination ports have disappeared, or are
+overloaded, the corresponding message copy is silently dropped.
+
+< The procedure is totally unexpected, right? In my mind, the procedure should
+lookup the publication name table based on the port name sequence to find out the 
+destination node. The fact is that the message will be broadcasted to all the
+node in the cluster, then receiver node will identifies the message itself. 
+This method seems inefficient, but high speed. >
+
+
+The multicast is pseudo, which is actually broadcast.
+
+Next, let's look at how to implement this.
+static int tipc_sendmcast(struct  socket *sock, struct tipc_name_seq *seq,
+			  struct msghdr *msg, size_t dsz, long timeo)
+{
+	struct sock *sk = sock->sk;
+	struct tipc_sock *tsk = tipc_sk(sk);
+	struct net *net = sock_net(sk);
+	struct tipc_msg *mhdr = &tsk->phdr;
+	struct sk_buff_head *pktchain = &sk->sk_write_queue;
+	struct iov_iter save = msg->msg_iter;
+	uint mtu;
+	int rc;
+
+	msg_set_type(mhdr, TIPC_MCAST_MSG);
+	msg_set_lookup_scope(mhdr, TIPC_CLUSTER_SCOPE);
+	msg_set_destport(mhdr, 0);
+	msg_set_destnode(mhdr, 0);
+	/* Destination port and node has been cleared */
+	msg_set_nametype(mhdr, seq->type);
+	msg_set_namelower(mhdr, seq->lower);
+	msg_set_nameupper(mhdr, seq->upper);
+	msg_set_hdr_sz(mhdr, MCAST_H_SIZE);
+
+new_mtu:
+	mtu = tipc_bclink_get_mtu();
+	rc = tipc_msg_build(mhdr, msg, 0, dsz, mtu, pktchain);
+	if (unlikely(rc < 0))
+		return rc;
+
+	do {
+		rc = tipc_bclink_xmit(net, pktchain);
+		if (likely(rc >= 0)) {
+			rc = dsz;
+			break;
+		}
+		if (rc == -EMSGSIZE) {
+			msg->msg_iter = save;
+			goto new_mtu;
+		}
+		if (rc != -ELINKCONG)
+			break;
+		tipc_sk(sk)->link_cong = 1;
+		rc = tipc_wait_for_sndmsg(sock, &timeo);
+		if (rc)
+			__skb_queue_purge(pktchain);
+	} while (!rc);
+	return rc;
+}
+
+int tipc_bclink_xmit(struct net *net, struct sk_buff_head *list)
+{
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+	struct tipc_link *bcl = tn->bcl;
+	struct tipc_bclink *bclink = tn->bclink;
+	int rc = 0;
+	int bc = 0;
+	struct sk_buff *skb;
+	struct sk_buff_head arrvq;
+	struct sk_buff_head inputq;
+
+	/* Prepare clone of message for local node */
+	skb = tipc_msg_reassemble(list);
+	if (unlikely(!skb)) {
+		__skb_queue_purge(list);
+		return -EHOSTUNREACH;
+	}
+	/* Broadcast to all nodes */
+	if (likely(bclink)) {
+		tipc_bclink_lock(net);
+		if (likely(bclink->bcast_nodes.count)) {
+			rc = __tipc_link_xmit(net, bcl, list);
+			if (likely(!rc)) {
+				u32 len = skb_queue_len(&bcl->transmq);
+
+				bclink_set_last_sent(net);
+				bcl->stats.queue_sz_counts++;
+				bcl->stats.accu_queue_sz += len;
+			}
+			bc = 1;
+		}
+		tipc_bclink_unlock(net);
+	}
+
+	if (unlikely(!bc))
+		__skb_queue_purge(list);
+
+	if (unlikely(rc)) {
+		kfree_skb(skb);
+		return rc;
+	}
+	/* Deliver message clone */
+	__skb_queue_head_init(&arrvq);
+	skb_queue_head_init(&inputq);
+	__skb_queue_tail(&arrvq, skb);
+	tipc_sk_mcast_rcv(net, &arrvq, &inputq);
+	return rc;
+}
+
+Two main steps:
+1. broad cast the message
+2. deliver the message to local ( invoking tipc_sk_mcast_rcv() )
+
+How is the tipc_link of broadcast setup?
+tipc_nl_net_set() -> tipc_net_start() -> tipc_bclink_init()
+A pseudo-link and pseudo-bearer will be setup.
+
+The pseudo-bearer contains some real bearer and its ->media.send_msg is 
+set to tipc_bcbearer_send()
+>>>>
+	for (bp_index = 0; bp_index < MAX_BEARERS; bp_index++) {
+		struct tipc_bearer *p = bcbearer->bpairs[bp_index].primary;
+		struct tipc_bearer *s = bcbearer->bpairs[bp_index].secondary;
+		struct tipc_bearer *bp[2] = {p, s};
+		struct tipc_bearer *b = bp[msg_link_selector(msg)];
+		struct sk_buff *tbuf;
+
+		if (!p)
+			break; /* No more bearers to try */
+		if (!b)
+			b = p;
+		tipc_nmap_diff(&bcbearer->remains, &b->nodes,
+			       &bcbearer->remains_new);
+		if (bcbearer->remains_new.count == bcbearer->remains.count)
+			continue; /* Nothing added by bearer pair */
+
+		if (bp_index == 0) {
+			/* Use original buffer for first bearer */
+			tipc_bearer_send(net, b->identity, buf, &b->bcast_addr);
+		} else {
+			/* Avoid concurrent buffer access */
+			tbuf = pskb_copy_for_clone(buf, GFP_ATOMIC);
+			if (!tbuf)
+				break;
+			tipc_bearer_send(net, b->identity, tbuf,
+					 &b->bcast_addr);
+			kfree_skb(tbuf); /* Bearer keeps a clone */
+		}
+		if (bcbearer->remains_new.count == 0)
+			break; /* All targets reached */
+
+		bcbearer->remains = bcbearer->remains_new;
+	}
+>>>>
+
+The tipc_bearer->nodes is a bitmap that indicates which nodes in cluster 
+can be reached through bearer.
+Here, it use tipc_nmap_diff() to decrease unnecessary broadcast.
+
+
+How does tipc_sk_mcast_rcv() handle the multi-cast message?
+
+void tipc_sk_mcast_rcv(struct net *net, struct sk_buff_head *arrvq,
+		       struct sk_buff_head *inputq)
+{
+	struct tipc_msg *msg;
+	struct tipc_plist dports;
+	u32 portid;
+	u32 scope = TIPC_CLUSTER_SCOPE;
+	struct sk_buff_head tmpq;
+	uint hsz;
+	struct sk_buff *skb, *_skb;
+
+	__skb_queue_head_init(&tmpq);
+	tipc_plist_init(&dports);
+
+	skb = tipc_skb_peek(arrvq, &inputq->lock);
+	for (; skb; skb = tipc_skb_peek(arrvq, &inputq->lock)) {
+		msg = buf_msg(skb);
+		hsz = skb_headroom(skb) + msg_hdr_sz(msg);
+
+		if (in_own_node(net, msg_orignode(msg)))
+			scope = TIPC_NODE_SCOPE;
+
+		/* Create destination port list and message clones: */
+		tipc_nametbl_mc_translate(net,
+					  msg_nametype(msg), msg_namelower(msg),
+					  msg_nameupper(msg), scope, &dports);
+		portid = tipc_plist_pop(&dports);
+		for (; portid; portid = tipc_plist_pop(&dports)) {
+			_skb = __pskb_copy(skb, hsz, GFP_ATOMIC);
+			if (_skb) {
+				msg_set_destport(buf_msg(_skb), portid);
+				__skb_queue_tail(&tmpq, _skb);
+				continue;
+			}
+			pr_warn("Failed to clone mcast rcv buffer\n");
+		}
+		/* Append to inputq if not already done by other thread */
+		spin_lock_bh(&inputq->lock);
+		if (skb_peek(arrvq) == skb) {
+			skb_queue_splice_tail_init(&tmpq, inputq);
+			kfree_skb(__skb_dequeue(arrvq));
+		}
+		spin_unlock_bh(&inputq->lock);
+		__skb_queue_purge(&tmpq);
+		kfree_skb(skb);
+	}
+	tipc_sk_rcv(net, inputq);
+}
+
+3 main steps:
+1. translate the port name sequence to port
+2. copy skb for echo port and set the destport id.
+3. transfer to tipc_sk_rcv()
+
+---------------------------------
+
+We should try to go deep into the concept of tipc broadcast link.
+
+We have known that, the a general link is a pair of nodes.
+We use tipc_node_find() to inquire the tipc_node based on node address.
+Through tipc_node->links[tipc_bearer->identity], we get the tipc_link.
+
+< One thing should be emphasized that what does the tipc_node structure represent
+is the peer endpoint node of the link, instead of local node. The
+tipc_link->links[] represents the links that connect to the peer node. The
+tipc_node->inputq contains the messages from the peer node, these messages will
+be delivered to tipc_sock() in tipc_node_unlock() >
+
+
+We cannot say a broadcast link is end-to-end, local and peer, thus, the link is
+pseudo. The pseudo broadcast link is saved in tipc_net->bclink, a tipc_bclink
+structure, a endpoint that faces all the broadcast sender in the cluster.
+tipc_bclink contains a tipc_link structure, its address will be saved in
+tipc_net->bcl. Well, there is another 'bclink' tipc_node_bclink structure saved in
+tipc_node->bclink, recording some broadcast status information of the peer node,
+which is a broadcast sender.
+
+
+The tipc broadcast is reliable.
+
+From the receiver's view, the broadcast messages from the sender must be sequential.
+The seqno is recorded in tipc_node_bclink->last_in.
+
+The out-of-sequence packets will be queued in tipc_node->bclink.deferdq.
+
+A in-sequence message will be queued to tipc_net->bclink->arrvq;
+
+tipc_bclink_rcv()
+>>>>
+	/* Handle in-sequence broadcast message */
+	seqno = msg_seqno(msg);
+	next_in = mod(node->bclink.last_in + 1);
+	arrvq = &tn->bclink->arrvq;
+	inputq = &tn->bclink->inputq;
+
+	if (likely(seqno == next_in)) {
+receive:
+		/* Deliver message to destination */
+		if (likely(msg_isdata(msg))) {
+			tipc_bclink_lock(net);
+			bclink_accept_pkt(node, seqno);
+			spin_lock_bh(&inputq->lock);
+			__skb_queue_tail(arrvq, buf);
+			spin_unlock_bh(&inputq->lock);
+			node->action_flags |= TIPC_BCAST_MSG_EVT;
+			tipc_bclink_unlock(net);
+			tipc_node_unlock(node);
+		} 
+	>>>>
+	}
+	/* Handle out-of-sequence broadcast message */
+	if (less(next_in, seqno)) {
+		deferred = tipc_link_defer_pkt(&node->bclink.deferdq,
+					       buf);
+		bclink_update_last_sent(node, seqno);
+		buf = NULL;
+	}
+>>>>
+Then the packets will be handled in tipc_node_unlock() -> tipc_bclink_input() 
+->tipc_sk_mcast_rcv()
+
+To achieve a reliable broadcast, there must be acknowledge and
+retransmit mechanism.
+
+bclink_accept_pkt() will update the tipc_node->bclink->last_in, this value
+indicates the seqno of the latest broadcast message from this node.
+
+Any tipc message would carry a broadcast ack, it is set by msg_set_bcast_ack().
+
+The broadcast sender will handle it.
+tipc_rcv()
+>>>>
+	if (unlikely(n_ptr->bclink.acked != msg_bcast_ack(msg)))
+			tipc_bclink_acknowledge(n_ptr, msg_bcast_ack(msg));
+>>>>
+The tipc_node->bclink->acked indicates the seqno of the last outbound broadcast
+message acknowledged by this node.
+
+tipc_bclink_acknowledge()
+>>>>
+	/* Skip over packets that node has previously acknowledged */
+	skb_queue_walk(&tn->bcl->transmq, skb) {
+		if (more(buf_seqno(skb), n_ptr->bclink.acked))
+			break;
+	}
+
+	/* Update packets that node is now acknowledging */
+	skb_queue_walk_from_safe(&tn->bcl->transmq, skb, tmp) {
+		if (more(buf_seqno(skb), acked))
+			break;
+		bcbuf_decr_acks(skb);
+		bclink_set_last_sent(net);
+		if (bcbuf_acks(skb) == 0) {
+			__skb_unlink(skb, &tn->bcl->transmq);
+			kfree_skb(skb);
+			released = 1;
+		}
+	}
+	n_ptr->bclink.acked = acked;
+>>>>
+
+The sender will record the count of the broadcast message's receiver and wait
+the acks from them. The message will be dequeued from the tipc_net->bcl->transmq
+only after all of the receivers has acked.
+
+The counts of the request acks of the skb is set in tipc_bcbearer_send()
+>>>>
+	if (likely(!msg_non_seq(buf_msg(buf)))) {
+		bcbuf_set_acks(buf, bclink->bcast_nodes.count);
+		msg_set_non_seq(msg, 1);
+		msg_set_mc_netid(msg, tn->net_id);
+		tn->bcl->stats.sent_info++;
+		if (WARN_ON(!bclink->bcast_nodes.count)) {
+			dump_stack();
+			return 0;
+		}
+	}
+
+>>>>
+
+Now, we have seen a reliable trace of the sent broadcast messages based on the
+seqno and acknowledge. Thus, how does the retransmission of broadcast work?
+
+When a link receive a LINK_PROTOCOL/STATE_MSG, in tipc_link_proto_rcv()
+>>>>
+		/* Protocol message before retransmits, reduce loss risk */
+		if (l_ptr->owner->bclink.recv_permitted)
+			tipc_bclink_update_link_state(l_ptr->owner,
+						      msg_last_bcast(msg));
+>>>>
+void tipc_bclink_update_link_state(struct tipc_node *n_ptr,
+				   u32 last_sent)
+{
+	struct sk_buff *buf;
+	struct net *net = n_ptr->net;
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+
+	/* Ignore "stale" link state info */
+	if (less_eq(last_sent, n_ptr->bclink.last_in))
+		return;
+
+	/* Update link synchronization state; quit if in sync */
+	bclink_update_last_sent(n_ptr, last_sent);
+
+	if (n_ptr->bclink.last_sent == n_ptr->bclink.last_in)
+		return;
+
+	/* Update out-of-sync state; quit if loss is still unconfirmed */
+	if ((++n_ptr->bclink.oos_state) == 1) {
+		if (n_ptr->bclink.deferred_size < (TIPC_MIN_LINK_WIN / 2))
+			return;
+		n_ptr->bclink.oos_state++;
+	}
+
+	/* Don't NACK if one has been recently sent (or seen) */
+	if (n_ptr->bclink.oos_state & 0x1)
+		return;
+
+	/* Send NACK */
+	buf = tipc_buf_acquire(INT_H_SIZE);
+	if (buf) {
+		struct tipc_msg *msg = buf_msg(buf);
+		struct sk_buff *skb = skb_peek(&n_ptr->bclink.deferdq);
+		u32 to = skb ? buf_seqno(skb) - 1 : n_ptr->bclink.last_sent;
+
+		tipc_msg_init(tn->own_addr, msg, BCAST_PROTOCOL, STATE_MSG,
+			      INT_H_SIZE, n_ptr->addr);
+		msg_set_non_seq(msg, 1);
+		msg_set_mc_netid(msg, tn->net_id);
+		msg_set_bcast_ack(msg, n_ptr->bclink.last_in);
+		msg_set_bcgap_after(msg, n_ptr->bclink.last_in);
+		msg_set_bcgap_to(msg, to);
+
+		tipc_bclink_lock(net);
+		tipc_bearer_send(net, MAX_BEARERS, buf, NULL);
+		tn->bcl->stats.sent_nacks++;
+		tipc_bclink_unlock(net);
+		kfree_skb(buf);
+
+		n_ptr->bclink.oos_state++;
+	}
+}
+
+
+The last_bcast bits is set in tipc_link_proto_xmit(), the value come from
+tipc_bclink_get_last_sent()
+u32 tipc_bclink_get_last_sent(struct net *net)
+{
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+
+	return tn->bcl->fsm_msg_cnt;
+}
+ tipc_bclink_update_link_state() use this last_send to judge whether need to
+ transmit a retransmission request.
+
+ 
+
+
+BCAST_PROTOCOL/STATE_MSG
+
+
+
+
+
+
+N: 1 bit : Non-sequenced message flag. If this bit is clear the
+message is part of the normal flow of messages between link
+endpoints. Payload messages that are sent to all cluster nodes
+using the broadcast link have this bit set.
+
+
+--------------------------------------------------------------------------
+< About the block >
+
+tipc_cfg_do_cmd()
+	-> cfg_set_own_addr()
+		-> tipc_core_start_net()
+			-> tipc_eth_media_start()
+				-> register_netdevice_notifier()
+net/tipc/eth_media.c 
+static struct notifier_block notifier = {
+	.notifier_call	= recv_notification,
+	.priority	= 0
+};
+
+recv_notification()
+>>>>
+	case NETDEV_UP:
+		tipc_continue(eb_ptr->bearer);
+		break;
+	case NETDEV_DOWN:
+		tipc_block_bearer(eb_ptr->bearer->name);
+		break;
+>>>>
+
+tipc_block_bearer()
+	----> b_ptr->blocked = 1
+	  |
+	  --> tipc_link_reset()
+tipc_continue() b->blocked = 0
+
+
+This block is used in many place, including discover.c
+
+tipc_disc_recv_msg()
+>>>>
+	if ((type == DSC_REQ_MSG) && !link_fully_up && !b_ptr->blocked) {
+		rbuf = tipc_disc_init_msg(DSC_RESP_MSG, orig, b_ptr);
+		if (rbuf) {
+			tipc_bearer_send(b_ptr, rbuf, &media_addr);
+			kfree_skb(rbuf);
+		}
+	}
+>>>>
+
+
+
+static void disc_send_msg(struct tipc_link_req *req)
+{
+	if (!req->bearer->blocked)
+		tipc_bearer_send(req->bearer, req->buf, &req->dest);
+}
+
+
+
+
+
+
