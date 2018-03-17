@@ -1664,4 +1664,18 @@ b. broadcast discovery message
 
 20. Why need a bearer list in tipc_net?
 
-21. 
+21. The topology of TIPC
+
+```
+---------------------
+domain(all clusters) |===> net working address
+---------------------
+cluster(all node) | ====> functional address
+------------------
+group node
+------------
+node
+------------
+slave node
+------------
+```
