@@ -1696,15 +1696,16 @@ tipc_net->nametbl->seq_hlist[]
                    [________]                              V
                    [________]             publ -> publ -> publ -> publ -> publ
 
+
 tipc_net->tipc_bearer *bearer_list[]
-									 			[_________]
-									 			[_________]
-									 			[_________] -> link_req -> *net
-									 			[_________]		-> domain
-									 			[_________]		-> *buf ===> request msg to sent
-									 			[.........]
-									 			[_________]
-									 			[_________] -> tipc_media *media
-									 			[_________]
+			[_________]
+			[_________]
+			[_________] -> link_req -> *net
+			[_________]		-> domain
+			[_________]		-> *buf ===> request msg to sent
+			[.........]
+			[_________]
+			[_________] -> tipc_media *media
+			[_________]
 
 ```
