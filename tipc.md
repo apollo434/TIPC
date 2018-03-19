@@ -1663,7 +1663,9 @@ b. broadcast discovery message
 ```
 
 20. Why need a bearer list in tipc_net?
-
+```
+bear is a media, which could based on L2 or L3(Mac or IP), it means bear could not be limited in physical topology, even the TIPC does not has forwarding and route function.
+```
 21. The topology of TIPC
 
 ```
@@ -1678,4 +1680,30 @@ node
 ------------
 slave node
 ------------
+```
+
+22. Sum up the key structure relationship
+```
+tipc_net->nametbl->seq_hlist[]
+                   hash buckets
+                   [________]
+                   [________]
+                   [________] -> name_seq -> sseqs
+                   [________]     type      Array
+                   [________]              [s0 ~ s1] -> name_info
+                   [........]              [s2 ~ s3]       |
+                   [________]              [s4 ~ s5]       |
+                   [________]                              V
+                   [________]             publ -> publ -> publ -> publ -> publ
+
+tipc_net->tipc_bearer *bearer_list[]
+											[_________]
+											[_________]
+											[_________] -> link_req -> *net
+											[_________]							-> domain
+											[_________]							-> *buf ===> request msg to sent
+											[.........]
+											[_________]
+											[_________] -> tipc_media *media
+											[_________]
 ```
